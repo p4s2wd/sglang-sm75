@@ -674,6 +674,8 @@ def _moe_combine_kernel(
     SCALE,
     HAS_SCALE: tl.constexpr,
     BLOCK: tl.constexpr,
+    USE_SLOT_MAP: tl.constexpr,
+    slot_map_ptr,  # [num_tokens, TOPK] int32, slot of each (token, k), or -1
 ):
     """Weighted sum over topk of the routed-expert outputs, in one kernel.
 
@@ -682,34 +684,83 @@ def _moe_combine_kernel(
     whole thing to fp32, multiplies by the routing weights and reduces over topk. That
     is 13 kernels and 30.6 us of device time at the decode shape against a ~1 us floor.
 
-    Each program owns one (token, hidden block) and walks the padded slots, accumulating
-    the rows whose owner is this token. The test is on a scalar, so a non-matching slot
-    costs one compare and no load, and the traffic is exactly topk rows per token.
-    num_valid is read from the device rather than passed as a value so the launch stays
-    capturable in a CUDA graph.
-
     Accumulation is fp32 with one cast at the end, matching the torch order: fp32
     multiply, fp32 sum over topk, then cast to the output dtype.
+
+    Two ways to find a token's rows, because the right one depends on the shape:
+
+    USE_SLOT_MAP=True walks a precomputed [num_tokens, TOPK] table of slot ids, so
+    the inner loop is exactly TOPK iterations. USE_SLOT_MAP=False keeps the original
+    scan of every padded slot, testing the owner scalar. The scan is fine at decode
+    (a handful of slots) but quadratic-ish at prefill: with 512 tokens x topk 6 the
+    padding runs to ~3072 slots and there are 4096 programs, so it issues ~12.6M
+    scalar owner loads to deliver 24576 row-block loads. The table turns that into
+    6 iterations per program and was measured at prefill shape on a 2080 Ti, where
+    this kernel was 2.7 ms/call -- 9.4% of PP3's device time.
     """
     tok = tl.program_id(0)
     offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    num_valid = tl.load(num_valid_ptr)
-    lo = tok * TOPK
-    hi = lo + TOPK
     acc = tl.zeros([BLOCK], dtype=tl.float32)
-    for s in range(0, num_slots):
-        owner = tl.load(sorted_ptr + s)
-        # Invalid means the pad sentinel or a position at or past num_valid, where
-        # sorted_ids is uninitialised and would otherwise index outside the output.
-        if (owner >= lo) & (owner < hi) & (s < num_valid):
-            w = tl.load(weight_ptr + owner)
-            v = tl.load(down_ptr + s.to(tl.int64) * down_stride + offs)
-            acc += w * v.to(tl.float32)
+
+    if USE_SLOT_MAP:
+        for k in tl.static_range(TOPK):
+            s = tl.load(slot_map_ptr + tok * TOPK + k)
+            if s >= 0:
+                w = tl.load(weight_ptr + tok * TOPK + k)
+                v = tl.load(down_ptr + s.to(tl.int64) * down_stride + offs)
+                acc += w * v.to(tl.float32)
+    else:
+        num_valid = tl.load(num_valid_ptr)
+        lo = tok * TOPK
+        hi = lo + TOPK
+        for s in range(0, num_slots):
+            owner = tl.load(sorted_ptr + s)
+            # Invalid means the pad sentinel or a position at or past num_valid, where
+            # sorted_ids is uninitialised and would otherwise index outside the output.
+            if (owner >= lo) & (owner < hi) & (s < num_valid):
+                w = tl.load(weight_ptr + owner)
+                v = tl.load(down_ptr + s.to(tl.int64) * down_stride + offs)
+                acc += w * v.to(tl.float32)
     if HAS_SCALE:
         acc = acc * SCALE
     tl.store(
         out_ptr + tok.to(tl.int64) * out_stride + offs, acc.to(out_ptr.dtype.element_ty)
     )
+
+
+@triton.jit
+def _moe_slot_map_scatter_kernel(
+    sorted_ptr,  # [num_slots] int32 owner = t*topk + k, or the pad sentinel
+    num_valid_ptr,  # [1] int32
+    map_ptr,  # [num_tokens*TOPK] int32, -1 where the pair has no live slot
+    num_slots,
+    NUM_PAIRS,  # num_tokens * topk
+    TOPK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """map[t*topk + k] = the slot whose owner is t*topk + k, or -1.
+
+    Scatter, not scan. One program per (owner, slot-block): it reads BLOCK owners,
+    and for each one stores its own position into map[owner]. Every slot is visited
+    exactly once, so this is O(num_slots) total work instead of the
+    O(num_slots * num_tokens * topk) a per-pair scan would do.
+
+    The map is pre-filled with -1 by the caller, so a pair with no live slot (its
+    experts were all filtered out) keeps -1 and the combine kernel skips it. Writing
+    -1 from here too would race: a later slot for the same owner would not be able to
+    tell it had already been written.
+
+    Graph-safe: no nonzero(), no host sync; num_valid is read on the device.
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < num_slots
+    owner = tl.load(sorted_ptr + offs, mask=mask, other=-1)
+    num_valid = tl.load(num_valid_ptr)
+    # Drop the pad sentinel and anything at or past num_valid, where sorted_ids is
+    # uninitialised and could index outside the map.
+    ok = mask & (owner >= 0) & (owner < NUM_PAIRS) & (offs < num_valid)
+    tl.store(map_ptr + owner, offs.to(tl.int32), mask=ok)
 
 
 def moe_combine(
@@ -721,6 +772,7 @@ def moe_combine(
     topk: int,
     scale=None,
     out: torch.Tensor = None,
+    use_slot_map: bool = None,
 ):
     """out[t] = sum over the topk slots owned by t of weight * down_slots[slot].
 
@@ -751,6 +803,39 @@ def moe_combine(
         BLOCK = next(
             (b for b in (256, 128, 64, 32, 16, 8, 4, 2, 1) if hidden % b == 0), 1
         )
+    # The slot table costs a fixed ~0.13 ms (a fill_ plus a scatter over num_slots)
+    # and turns the inner loop from num_slots to topk. It only pays once the scan is
+    # long enough to dwarf that: measured on a 2080 Ti at H=2048, topk=6,
+    #   B=128 slots=1024 -> scan 0.106 ms, table 0.222 ms  (0.48x, keep the scan)
+    # B=256 slots=1792 -> scan 0.251 ms, table 0.221 ms  (1.13x, break even)
+    #   B=512 slots=3072 -> scan 0.660 ms, table 0.232 ms  (2.85x)
+    #   B=512 slots=4096 -> scan 0.853 ms, table 0.222 ms  (3.84x)
+    # The crossover sits near B=256, i.e. where num_slots >= ~28x topk. The
+    # num_tokens floor keeps small batches out even when the padding ratio is high:
+    # at B=8 a padded num_slots can clear 28x topk while the whole combine is only
+    # tens of microseconds, so the table's fixed cost would dominate. Decode
+    # (B=1, num_slots ~ 8x topk) stays on the scan, which is what it wants.
+    if use_slot_map is None:
+        use_slot_map = num_tokens >= 256 and num_slots >= 28 * topk
+    slot_map = None
+    if use_slot_map:
+        npairs = num_tokens * topk
+        # Filled with -1 first so pairs with no live slot stay -1; the scatter then
+        # writes the real slot ids. fill_ is a device op, so this stays graph-safe.
+        slot_map = torch.full(
+            (npairs,), -1, dtype=torch.int32, device=down_slots.device
+        )
+        SBLOCK = 256
+        _moe_slot_map_scatter_kernel[(triton.cdiv(num_slots, SBLOCK),)](
+            sorted_ids,
+            num_valid,
+            slot_map,
+            num_slots,
+            npairs,
+            TOPK=topk,
+            BLOCK=SBLOCK,
+            num_warps=4,
+        )
     _moe_combine_kernel[(num_tokens, hidden // BLOCK)](
         down_slots,
         sorted_ids,
@@ -764,6 +849,8 @@ def moe_combine(
         SCALE=1.0 if scale is None else float(scale),
         HAS_SCALE=scale is not None,
         BLOCK=BLOCK,
+        USE_SLOT_MAP=use_slot_map,
+        slot_map_ptr=slot_map if slot_map is not None else sorted_ids,
         num_warps=2 if BLOCK <= 512 else 4,
     )
     return out

@@ -5356,9 +5356,16 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         name = name.replace(".gate.tid2eid", ".topk.tid2eid")
         name = name.replace(".gate.bias", ".gate.e_score_correction_bias")
-        name = name.replace(".w1.", ".gate_proj.")
-        name = name.replace(".w2.", ".down_proj.")
-        name = name.replace(".w3.", ".up_proj.")
+        # Scoped to the MoE: the w1/w2/w3 spelling is the SwiGLU convention, so
+        # a checkpoint that carries another submodule using it (the vision
+        # aligner is an MLP too) would otherwise be rewritten into an MoE
+        # projection name. Rewritten to a name this architecture has no
+        # parameter for, the stacked-mapping lookup below raises KeyError and
+        # the whole load dies on weights that were never meant to be loaded.
+        if "experts" in name:
+            name = name.replace(".w1.", ".gate_proj.")
+            name = name.replace(".w2.", ".down_proj.")
+            name = name.replace(".w3.", ".up_proj.")
         if "mlp" in name and name.endswith(".scale"):
             name = name.removesuffix(".scale") + ".weight_scale_inv"
 
@@ -5608,6 +5615,14 @@ class DeepseekV4ForCausalLM(nn.Module):
                             continue
                         if name not in params_dict and name.startswith("mtp"):
                             break
+                        if name not in params_dict:
+                            # A checkpoint submodule this architecture does not
+                            # implement (a vision tower and its projector, say)
+                            # can spell its weights so that they match a stacked
+                            # mapping. Skip it like any other unmatched tensor
+                            # rather than failing the whole load.
+                            logger.warning(f"{name} not found in params_dict.")
+                            continue
                         param = params_dict[name]
                         weight_loader = param.weight_loader
                         maybe_executor_submit(

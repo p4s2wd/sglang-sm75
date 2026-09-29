@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.kernels.jit.utils import (
     cache_once,
@@ -98,6 +100,126 @@ def topk_transform_bf16_small(
     """
     _jit_topk_bf16_small_module().topk_transform(
         scores, seq_lens, page_table, out_page_indices, page_size
+    )
+
+
+@triton.jit
+def _topk_transform_paged_triton_kernel(
+    scores_ptr,
+    seq_lens_ptr,
+    page_tables_ptr,
+    out_page_indices_ptr,
+    out_raw_indices_ptr,
+    max_seq_len,
+    stride_scores,
+    page_table_width,
+    stride_page_tables,
+    K: tl.constexpr,
+    K_POW2: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    WRITE_RAW: tl.constexpr,
+):
+    row = tl.program_id(0)
+    seq_len = tl.load(seq_lens_ptr + row)
+    offs_n = tl.arange(0, BLOCK_N)
+    acc = tl.zeros((K_POW2,), dtype=tl.uint64)
+    for start in range(0, seq_len, BLOCK_N):
+        cols = start + offs_n
+        valid = cols < seq_len
+        score = tl.load(
+            scores_ptr + row * stride_scores + cols,
+            mask=valid,
+            other=float("-inf"),
+        )
+        score_bits = score.to(tl.uint32, bitcast=True)
+        sign = tl.full(score_bits.shape, 0x80000000, tl.uint32)
+        key = tl.where(
+            (score_bits & sign) != 0,
+            ~score_bits,
+            score_bits ^ sign,
+        )
+        packed = (key.to(tl.uint64) << 32) | cols.to(tl.uint64)
+        candidate = tl.topk(packed, K_POW2, dim=0)
+        acc = tl.bitonic_merge(acc)
+        acc = tl.maximum(acc, tl.topk(candidate, K_POW2, dim=0))
+    acc = tl.sort(acc, descending=True)
+    offs_k = tl.arange(0, K_POW2)
+    raw = (acc & 0xFFFFFFFF).to(tl.int32)
+    valid = (offs_k < K) & (offs_k < seq_len)
+    page_ids = raw // PAGE_SIZE
+    page_ids = tl.where(valid, page_ids, 0)
+    pages = tl.load(
+        page_tables_ptr + row * stride_page_tables + page_ids,
+        mask=valid,
+        other=0,
+    )
+    page_indices = pages * PAGE_SIZE + raw % PAGE_SIZE
+    page_indices = tl.where(valid, page_indices, -1).to(tl.int32)
+    tl.store(
+        out_page_indices_ptr + row * K + offs_k,
+        page_indices,
+        mask=offs_k < K,
+    )
+    if WRITE_RAW:
+        raw = tl.where(valid, raw, -1)
+        tl.store(
+            out_raw_indices_ptr + row * K + offs_k,
+            raw,
+            mask=offs_k < K,
+        )
+
+
+def topk_transform_paged_triton(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    out_raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    assert scores.ndim == 2
+    assert scores.dtype == torch.float32
+    assert scores.stride(1) == 1
+    assert scores.stride(0) > 0
+    assert seq_lens.ndim == 1 and seq_lens.shape[0] == scores.shape[0]
+    assert page_tables.ndim == 2 and page_tables.shape[0] == scores.shape[0]
+    assert page_tables.stride(1) == 1
+    assert out_page_indices.ndim == 2
+    assert out_page_indices.shape[0] == scores.shape[0]
+    assert out_page_indices.dtype == torch.int32
+    K = out_page_indices.shape[1]
+    K_POW2 = triton.next_power_of_2(K)
+    assert 0 < K <= 1024
+    assert page_size > 0
+    assert page_size & (page_size - 1) == 0
+    if out_raw_indices is None:
+        raw_indices = out_page_indices
+        write_raw = False
+    else:
+        raw_indices = out_raw_indices
+        assert raw_indices.shape == out_page_indices.shape
+        assert raw_indices.dtype == torch.int32
+        write_raw = True
+    BLOCK_N = max(256, min(K_POW2, 1024))
+    grid = (scores.shape[0],)
+    _topk_transform_paged_triton_kernel[grid](
+        scores,
+        seq_lens,
+        page_tables,
+        out_page_indices,
+        raw_indices,
+        scores.shape[1],
+        scores.stride(0),
+        page_tables.shape[1],
+        page_tables.stride(0),
+        K=K,
+        K_POW2=K_POW2,
+        BLOCK_N=BLOCK_N,
+        PAGE_SIZE=page_size,
+        WRITE_RAW=write_raw,
+        num_warps=4,
+        num_stages=1,
     )
 
 

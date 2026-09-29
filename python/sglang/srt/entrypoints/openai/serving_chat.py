@@ -4,6 +4,7 @@ import copy
 import json
 import logging
 import math
+import os
 import time
 import uuid
 from collections import OrderedDict
@@ -265,6 +266,69 @@ def _build_video_config(request: ChatCompletionRequest) -> dict[str, Any] | None
     return config or None
 
 
+# Sampling parameters a deployment can pin for clients that send none.
+# See _sampling_params_override_from_env.
+_SAMPLING_PARAM_NAMES = (
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "repetition_penalty",
+)
+
+
+def _sampling_params_override_from_env(
+    model_defaults: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Deployment override for the default sampling parameters.
+
+    A request that omits the sampling parameters falls back to the checkpoint's
+    ``generation_config.json`` (or, with ``--sampling-defaults openai``, to
+    sglang's own defaults). Both of those are ``temperature=1.0, top_p=1.0``,
+    which is a fine placeholder for "unspecified" and unusable for anything
+    that has to emit structured text: tool-call arguments run to thousands of
+    tokens, and unrestricted sampling over that many steps reliably injects
+    stray tokens into the JSON the caller has to parse. Measured on this box with
+    a 2472-character verbatim-copy prompt: similarity to the target 0.9998 at
+    ``temperature=0`` versus 0.36 at ``temperature=1.0``.
+
+    ``SGLANG_DEFAULT_SAMPLING_PARAMS`` takes a JSON object over the same names,
+    e.g. ``{"temperature": 0.6, "top_p": 0.95}``. It lands in the same dict as
+    the model generation config, so the precedence stays
+    request value > this override > model generation config > sglang default:
+    a client that sets ``temperature`` itself is never overridden. Unset (the
+    default) changes nothing.
+    """
+    raw = os.environ.get("SGLANG_DEFAULT_SAMPLING_PARAMS", "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"SGLANG_DEFAULT_SAMPLING_PARAMS is not valid JSON: {exc}"
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            "SGLANG_DEFAULT_SAMPLING_PARAMS must be a JSON object, got "
+            f"{type(parsed).__name__}"
+        )
+    unknown = set(parsed) - set(_SAMPLING_PARAM_NAMES)
+    if unknown:
+        raise ValueError(
+            f"SGLANG_DEFAULT_SAMPLING_PARAMS has unknown key(s) {sorted(unknown)}; "
+            f"supported: {list(_SAMPLING_PARAM_NAMES)}"
+        )
+    if parsed != model_defaults:
+        logger.warning(
+            "Overriding default chat sampling params %s with %s from "
+            "SGLANG_DEFAULT_SAMPLING_PARAMS",
+            model_defaults or "{}",
+            parsed,
+        )
+    return parsed
+
+
 class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
@@ -303,12 +367,15 @@ class OpenAIServingChat(OpenAIServingBase):
         self.default_sampling_params = (
             self.tokenizer_manager.model_config.get_default_sampling_params()
         )
+        self.default_sampling_params.update(
+            _sampling_params_override_from_env(self.default_sampling_params)
+        )
         if (
             self.default_sampling_params
             and not OpenAIServingChat._default_sampling_params_logged
         ):
             logger.info(
-                f"Using default chat sampling params from model generation config: {self.default_sampling_params}",
+                f"Using default chat sampling params: {self.default_sampling_params}",
             )
             OpenAIServingChat._default_sampling_params_logged = True
 
@@ -1583,6 +1650,14 @@ class OpenAIServingChat(OpenAIServingBase):
                     thinking_mode=thinking_mode,
                     reasoning_effort=v4_reasoning_effort,
                     reasoning_effort_profile=reasoning_effort_profile,
+                    # A leading <|begin_of_sentence|> is not what this
+                    # checkpoint was trained to start a chat with: with it,
+                    # greedy decoding emits the BOS token again and keeps
+                    # doing so for the whole budget (measured 2026-09-28 on the
+                    # sub-80 build, short chat turns and 6K-token prompts
+                    # alike). The tokenizer itself adds no BOS
+                    # (add_bos_token is false), so nothing else supplies one.
+                    add_default_bos_token=False,
                 )
                 prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
             elif is_dsv41:

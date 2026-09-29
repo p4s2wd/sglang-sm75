@@ -51,6 +51,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
+
 BLOCK_SCALE = 128
 
 # Above this many activation rows the projection stops being bandwidth bound and
@@ -214,6 +216,17 @@ _W8A16_WIDE = True
 # remains. The largest winning grid is 1792, the smallest losing one 6144.
 _WIDE_MIN_K = 2048
 _WIDE_MAX_GRID = 2048
+
+
+def _should_use_w8a16_wide(
+    rows: int, n: int, k: int, allow_k1024: bool = False
+) -> bool:
+    return (
+        _W8A16_WIDE
+        and rows <= 2
+        and (k >= _WIDE_MIN_K or (allow_k1024 and k == 1024))
+        and triton.cdiv(n, 4) <= _WIDE_MAX_GRID
+    )
 
 
 @triton.jit
@@ -493,11 +506,11 @@ def _w8a16_linear_impl(
         # Two divisibility requirements the narrow kernel does not have: block_k must
         # divide k, because these loads are unmasked, and block_n must divide the
         # 128-row scale group, because the scale is indexed by a single group per tile.
-        if (
-            _W8A16_WIDE
-            and m <= 2
-            and k >= _WIDE_MIN_K
-            and triton.cdiv(n, 4) <= _WIDE_MAX_GRID
+        if _should_use_w8a16_wide(
+            m,
+            n,
+            k,
+            allow_k1024=envs.SGLANG_OPT_W8A16_WIDE_M1_K1024.get(),
         ):
             # See _WIDE_MIN_K / _WIDE_MAX_GRID for where these two numbers come from.
             block_k = 2048

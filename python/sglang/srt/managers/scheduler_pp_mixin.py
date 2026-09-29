@@ -176,6 +176,31 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
+                early_proxy_send = (
+                    envs.SGLANG_PP_EARLY_PROXY_SEND.get()
+                    and not self.pp_group.is_last_rank
+                    and cur_batch is not None
+                )
+                if early_proxy_send:
+                    with torch.profiler.record_function(
+                        "send_proxy_dict_to_next_stage"
+                    ):
+                        self.send_proxy_work = self._pp_send_dict_to_next_stage(
+                            result.pp_hidden_states_proxy_tensors.tensors,
+                            async_send=True,
+                            msg_type="proxy",
+                            # ready_event, not a wait on the schedule stream
+                            # here: the wait has to be issued on the comm
+                            # stream the send runs on, which is what the helper
+                            # does with it.
+                            ready_event=self.launch_event,
+                        )
+                    # The commit above reads and clears this flag, so the send
+                    # that happens here has to set it again. Skipping it lets
+                    # the next forward replay a CUDA graph while NCCL is still
+                    # reading the previous step's proxy tensors, which are views
+                    # of replay-owned static buffers.
+                    self.send_proxy_requires_forward_fence = result.can_run_cuda_graph
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
                     process_target = self.mbs[next_mb_id]
@@ -190,7 +215,7 @@ class SchedulerPPMixin:
                             next_batch_result,
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
-                if not self.pp_group.is_last_rank:
+                if not early_proxy_send and not self.pp_group.is_last_rank:
                     if cur_batch:
                         self._pp_send_proxy_to_next_stage(result)
 

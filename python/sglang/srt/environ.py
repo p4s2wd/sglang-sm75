@@ -663,6 +663,10 @@ class Envs:
     # Run PP tensor communication on a dedicated stream so asynchronous sends
     # do not fence the next forward through the scheduler stream.
     SGLANG_PP_COMM_OVERLAP = EnvBool(False)
+    # PP: start the proxy-dict send for the current micro-batch before the
+    # result post-processing below, so the send overlaps the host-side work
+    # instead of following it. See SchedulerPPMixin.
+    SGLANG_PP_EARLY_PROXY_SEND = EnvBool(False)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
 
     # ===================================================================
@@ -1173,7 +1177,7 @@ class Envs:
     # only ever be too narrow, which the existing
     # `assert actual_max_seq_len <= chosen_max_seq_len` turns into a crash rather
     # than silently dropped context. Set empty to disable (one graph per batch size).
-    SGLANG_DSV4_DECODE_SEQ_LEN_BUCKETS = EnvStr("8192")
+    SGLANG_DSV4_DECODE_SEQ_LEN_BUCKETS = EnvStr("8192,16384,32768,65536,131072")
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
@@ -1375,6 +1379,8 @@ class Envs:
     # and benchmarks at parity, so this is a consolidation escape hatch, not a perf flip.
     SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
+    SGLANG_OPT_USE_SM75_C4_TOPK = EnvBool(False)
+    SGLANG_OPT_W8A16_WIDE_M1_K1024 = EnvBool(False)
 
     # ===================================================================
     # Kernel selection and fused backends

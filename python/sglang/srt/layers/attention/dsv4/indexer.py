@@ -22,6 +22,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_quant,
     plan_topk_v2,
     topk_transform_paged,
+    topk_transform_paged_triton,
     topk_transform_paged_v2,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
@@ -621,6 +622,11 @@ class C4IndexerBackendMixin:
             )
         return q, weights
 
+    def _deepgemm_available(self) -> bool:
+        from sglang.srt.layers import deep_gemm_wrapper
+
+        return deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+
     def _can_use_nonpaged_indexer(
         self,
         *,
@@ -648,7 +654,10 @@ class C4IndexerBackendMixin:
             c4_indexer.use_fp4_indexer
             or envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
             or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
-            or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            or (
+                envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+                and self._deepgemm_available()
+            )
         ):
             return False
         if (
@@ -694,7 +703,13 @@ class C4IndexerBackendMixin:
         def to_cpu_int_list(values) -> Optional[List[int]]:
             if isinstance(values, torch.Tensor):
                 if values.device.type != "cpu":
-                    return None
+                    # The DSV4 backend sets needs_cpu_seq_lens=False, so the
+                    # scheduler hands us the device tensor. The plan is built
+                    # once per chunk and cached on the metadata, so this
+                    # one-shot sync is amortized over the chunk's layers and is
+                    # far cheaper than the paged torch-logits fallback it
+                    # unlocks (measured 14 ms/layer at a 512-row chunk).
+                    values = values.cpu()
                 values = values.tolist()
             return [int(value) for value in values]
 
@@ -994,14 +1009,29 @@ class C4IndexerBackendMixin:
         ) -> None:
             row_raw_indices = raw_indices[rows] if raw_indices is not None else None
             if self.dsa_topk_backend.is_torch():
-                topk_transform_pytorch_vectorized(
-                    logits,
-                    c4_seq_lens[rows],
-                    page_table[rows],
-                    c4_sparse_page_indices[rows],
-                    indexer_metadata.compressed_page_size,
-                    row_raw_indices,
+                use_sm75_triton = (
+                    envs.SGLANG_OPT_USE_SM75_C4_TOPK.get()
+                    and logits.is_cuda
+                    and torch.cuda.get_device_capability(logits.device)[0] == 7
                 )
+                if use_sm75_triton:
+                    topk_transform_paged_triton(
+                        logits,
+                        c4_seq_lens[rows],
+                        page_table[rows],
+                        c4_sparse_page_indices[rows],
+                        indexer_metadata.compressed_page_size,
+                        row_raw_indices,
+                    )
+                else:
+                    topk_transform_pytorch_vectorized(
+                        logits,
+                        c4_seq_lens[rows],
+                        page_table[rows],
+                        c4_sparse_page_indices[rows],
+                        indexer_metadata.compressed_page_size,
+                        row_raw_indices,
+                    )
             elif self.dsa_topk_backend.is_flashinfer():
                 self.flashinfer_topk_transform(
                     logits,
