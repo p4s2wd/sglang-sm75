@@ -494,8 +494,13 @@ def handle_model_specific_adjustments(server_args: Any):
                 envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.set(False)
                 envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
                 envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
-                if server_args.moe_runner_backend in (None, "auto"):
-                    server_args.moe_runner_backend = "triton"
+                if cfg.moe_runner_backend in (None, "auto"):
+                    # Resolution does not write to the record, it declares.
+                    declare_resolution(
+                        server_args,
+                        "_handle_model_specific_adjustments",
+                        moe_runner_backend="triton",
+                    )
                 # The torch top-k path is the only one that can run here (see
                 # DSATopKBackend._arch_supports_sgl_kernel, which does the
                 # downgrade at resolve time -- assigning dsa_topk_backend here
