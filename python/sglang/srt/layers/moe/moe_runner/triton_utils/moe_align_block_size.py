@@ -5,6 +5,7 @@ from typing import Tuple
 import torch
 import triton
 
+from sglang.kernels.jit.utils import cache_once
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_xpu
 
@@ -23,6 +24,21 @@ if _is_cuda:
         SMALL_NUMEL_LIMIT,
         moe_align_small_numel,
     )
+
+
+# The AOT align kernel ships cubins for sm_80 and newer, so on pre-sm80 it
+# fails with "no kernel image is available for execution on the device". The
+# JIT variant compiles for the local architecture instead; it takes no
+# ignore_invalid_expert (that is a different id-offset contract).
+@cache_once
+def _use_jit_align() -> bool:
+    if not _is_cuda:
+        return False
+    from sglang.srt.utils import get_device_capability
+
+    major, _minor = get_device_capability()
+    return major is not None and major < 8
+
 
 # Where the CUDA kernel's own small-batch single-block path stops: its
 # per-thread histogram costs 4 * (buckets + 1) ** 2 bytes of shared memory.
@@ -122,6 +138,23 @@ def moe_align_block_size(
             sorted_ids,
             expert_ids,
             num_tokens_post_pad,
+        )
+        return sorted_ids, expert_ids, num_tokens_post_pad
+
+    if _use_jit_align():
+        from sglang.kernels.ops.moe.moe_align import (
+            moe_align_block_size as jit_moe_align_block_size,
+        )
+
+        jit_moe_align_block_size(
+            topk_ids,
+            num_experts + 1,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            cumsum_buffer,
+            True,
         )
         return sorted_ids, expert_ids, num_tokens_post_pad
 

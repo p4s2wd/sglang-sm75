@@ -94,6 +94,27 @@ def _set_capture_attention_variant(variant: Optional[str]) -> None:
     _capture_attention_variant = variant
 
 
+_capture_seq_len_bucket: Optional[int] = None
+
+
+def get_capture_seq_len_bucket() -> Optional[int]:
+    """Width (in tokens) the decode graph currently being captured should scan.
+
+    The decode runner captures one graph per seq_len bucket so that a short
+    sequence does not pay for the context length: the indexer's logits row width
+    is decided at capture time and baked into the graph, so a single graph
+    captured at the full context length makes an 11-token request scan 262,144
+    columns every step. None means no bucketing is active and the backend should
+    use its own default (the full context length).
+    """
+    return _capture_seq_len_bucket
+
+
+def _set_capture_seq_len_bucket(bucket: Optional[int]) -> None:
+    global _capture_seq_len_bucket
+    _capture_seq_len_bucket = bucket
+
+
 @contextmanager
 def model_capture_mode():
     global is_capture_mode

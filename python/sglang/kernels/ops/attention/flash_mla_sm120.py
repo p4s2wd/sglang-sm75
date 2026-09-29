@@ -13,6 +13,7 @@ separate region at the end of each page.
 
 import logging
 import math
+import os
 from functools import lru_cache
 from typing import FrozenSet, Optional, Tuple
 
@@ -133,7 +134,81 @@ def _gather_and_dequant(k_cache, indices, page_size):
     return result.reshape(*idx_shape, _D)
 
 
+# The PyTorch fallback gather materializes, per batch item, s_q x topk x
+# head_dim in uint8 plus three fp32/bf16 temporaries. That peak scales with the
+# batch, and on a card already holding the model it is what kills a long prompt:
+# the real DeepSeek-V4-Flash weights died at 288 prompt tokens asking for 450 MiB
+# with 237 MiB free. Bound the peak by chunking the batch instead.
+#
+# The default is deliberately below that 237 MiB of headroom, and it is the
+# *aggregate* peak (all temporaries together), not one tensor. Override with
+# SGLANG_SPARSE_MLA_TORCH_CHUNK_BYTES on a card with more room -- larger chunks
+# mean fewer kernel launches.
+_SPARSE_MLA_TORCH_CHUNK_BYTES = int(
+    os.environ.get("SGLANG_SPARSE_MLA_TORCH_CHUNK_BYTES", 128 * 1024 * 1024)
+)
+
+
+def _sparse_decode_chunk_items(query_len: int, topk_total: int, head_dim: int) -> int:
+    """Batch items per chunk so the gather peak stays under the budget."""
+    per_item = max(query_len * topk_total * head_dim * 12, 1)
+    return max(1, _SPARSE_MLA_TORCH_CHUNK_BYTES // per_item)
+
+
 def _sm120_sparse_decode_fwd(
+    q,
+    k_cache,
+    indices,
+    topk_length,
+    attn_sink,
+    head_dim_v,
+    softmax_scale,
+    extra_k_cache=None,
+    extra_indices=None,
+    extra_topk_length=None,
+):
+    # Chunk the batch. Attention is independent per query position, so
+    # splitting on dim 0 and concatenating is exact.
+    B, s_q, H_q, D_qk = q.shape
+    topk_total = indices.shape[-1] + (
+        extra_indices.shape[-1] if extra_indices is not None else 0
+    )
+    chunk = _sparse_decode_chunk_items(s_q, topk_total, D_qk)
+    if q.shape[0] <= chunk:
+        return _sm120_sparse_decode_fwd_chunk(
+            q,
+            k_cache,
+            indices,
+            topk_length,
+            attn_sink,
+            head_dim_v,
+            softmax_scale,
+            extra_k_cache,
+            extra_indices,
+            extra_topk_length,
+        )
+
+    outs, lses = [], []
+    for start in range(0, q.shape[0], chunk):
+        stop = min(start + chunk, q.shape[0])
+        out_c, lse_c = _sm120_sparse_decode_fwd_chunk(
+            q[start:stop],
+            k_cache,
+            indices[start:stop],
+            None if topk_length is None else topk_length[start:stop],
+            attn_sink,
+            head_dim_v,
+            softmax_scale,
+            extra_k_cache,
+            None if extra_indices is None else extra_indices[start:stop],
+            None if extra_topk_length is None else extra_topk_length[start:stop],
+        )
+        outs.append(out_c)
+        lses.append(lse_c)
+    return torch.cat(outs, dim=0), torch.cat(lses, dim=0)
+
+
+def _sm120_sparse_decode_fwd_chunk(
     q,
     k_cache,
     indices,
@@ -201,12 +276,59 @@ def _sm120_sparse_decode_fwd(
     out = torch.einsum("bsht,bstv->bshv", weights, kv_f[..., :head_dim_v])
     out[lonely.unsqueeze(-1).expand_as(out)] = 0.0
 
-    return out.to(torch.bfloat16), lse.permute(0, 2, 1)
+    # Return in the query dtype rather than hardcoding bfloat16: sub-90
+    # (SM75/SM80) runs the model in float16, where a bf16 round-trip can
+    # overflow (fp16 max 65504 < bf16 max 3.4e38).
+    return out.to(q.dtype), lse.permute(0, 2, 1)
 
 
 # SM120 FlashMLA: default FlashInfer (CUTLASS SM120 sparse MLA decode).
 # Override with SGLANG_SM120_FLASHMLA_BACKEND=triton|torch to force fallback.
-_sm120_default_backend = envs.SGLANG_SM120_FLASHMLA_BACKEND.get()
+#
+# The FlashInfer path JIT-compiles a CUTLASS module that only targets sm_120;
+# on any other architecture that build fails outright ("No supported CUDA
+# architectures found for major versions [12]"), so it cannot be the default
+# there. Sub-90 (SM75/SM80) reuses this module for its sparse decode: SM75
+# defaults to the fused Triton path (measured faster than torch end to end on
+# the production 2080 Ti box), other architectures fall back to pure PyTorch.
+# An explicit SGLANG_SM120_FLASHMLA_BACKEND always wins.
+_BACKEND_OVERRIDE = (
+    envs.SGLANG_SM120_FLASHMLA_BACKEND.get()
+    if envs.SGLANG_SM120_FLASHMLA_BACKEND.is_set()
+    else None
+)
+_backend_cache = None
+
+
+def _default_backend() -> str:
+    global _backend_cache
+    if _backend_cache is None:
+        if _BACKEND_OVERRIDE is not None:
+            _backend_cache = _BACKEND_OVERRIDE
+        elif not torch.cuda.is_available():
+            _backend_cache = "torch"
+        else:
+            major, _minor = torch.cuda.get_device_capability()
+            if major == 12:
+                _backend_cache = "flashinfer"
+            elif major == 7:
+                # Turing (SM75): the fused Triton sparse decode beat the torch
+                # gather path end to end on the 8x 2080 Ti production box
+                # (2026-09-24, same-server A/B, 150 W): short-context decode
+                # 17.4 -> 19.4 tok/s, prefill 716 -> 1057 @11.5K (+47%),
+                # bs=8 batched vs solo 8/8 byte-identical. rel 5.7e-4 vs the
+                # torch path (not bit-equal), verified against an fp32
+                # reference in the kernel's own test.
+                _backend_cache = "triton"
+            else:
+                _backend_cache = "torch"
+        if _backend_cache != "flashinfer":
+            logger.info(
+                "SM120 FlashMLA entry point using the %s backend (FlashInfer's "
+                "sparse-MLA kernel is sm_120-only).",
+                _backend_cache,
+            )
+    return _backend_cache
 
 
 SM120_DECODE_MAX_TOKENS = 64
@@ -313,7 +435,7 @@ def flash_mla_with_kvcache_sm120(**kwargs):
     extra_indices = kwargs.get("extra_indices_in_kvcache")
     extra_topk_length = kwargs.get("extra_topk_length")
 
-    if _sm120_default_backend == "flashinfer":
+    if _default_backend() == "flashinfer":
         if q.shape[0] > SM120_DECODE_MAX_TOKENS:
             return _flash_mla_sm120_prefill(
                 q,
@@ -340,7 +462,7 @@ def flash_mla_with_kvcache_sm120(**kwargs):
             extra_topk_length,
         )
 
-    if _sm120_default_backend == "triton":
+    if _default_backend() == "triton":
         from sglang.kernels.ops.attention.flash_mla_sm120_triton import (
             flash_mla_sparse_decode_triton,
         )

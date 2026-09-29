@@ -1357,6 +1357,97 @@ def mhc_post_tilelang(
             T.pdl_trigger()
 
 
+@triton.jit
+def _hc_post_small_hc_kernel(
+    x_ptr,
+    res_ptr,
+    post_ptr,
+    comb_ptr,
+    out_ptr,
+    hidden,
+    stride_xt,
+    stride_rt,
+    stride_pt,
+    stride_ct,
+    stride_ot,
+    HC: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """out[t, j, h] = post[t, j] * x[t, h] + sum_m comb[t, m, j] * res[t, m, h]
+
+    One program owns BLOCK_H hidden columns for every channel of one token, so
+    the hc_mult^2 comb matrix and the hc_mult post weights are loaded once and
+    the hc_mult residual tiles stay in registers across all output channels.
+    """
+    pid_h = tl.program_id(0)
+    t = tl.program_id(1)
+
+    cols = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = cols < hidden
+
+    x_row = tl.load(x_ptr + t * stride_xt + cols, mask=mask, other=0.0).to(tl.float32)
+
+    r_base = res_ptr + t * stride_rt
+    r0 = tl.load(r_base + 0 * hidden + cols, mask=mask, other=0.0).to(tl.float32)
+    r1 = tl.load(r_base + 1 * hidden + cols, mask=mask, other=0.0).to(tl.float32)
+    r2 = tl.load(r_base + 2 * hidden + cols, mask=mask, other=0.0).to(tl.float32)
+    r3 = tl.load(r_base + 3 * hidden + cols, mask=mask, other=0.0).to(tl.float32)
+
+    c_base = comb_ptr + t * stride_ct
+    p_base = post_ptr + t * stride_pt
+    o_base = out_ptr + t * stride_ot
+    for j in tl.static_range(HC):
+        acc = tl.load(p_base + j).to(tl.float32) * x_row
+        acc += tl.load(c_base + 0 * HC + j).to(tl.float32) * r0
+        acc += tl.load(c_base + 1 * HC + j).to(tl.float32) * r1
+        acc += tl.load(c_base + 2 * HC + j).to(tl.float32) * r2
+        acc += tl.load(c_base + 3 * HC + j).to(tl.float32) * r3
+        tl.store(
+            o_base + j * hidden + cols, acc.to(out_ptr.dtype.element_ty), mask=mask
+        )
+
+
+def mhc_post_triton(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+) -> torch.Tensor:
+    """Triton mhc_post for hc_mult == 4, for GPUs with no TileLang backend.
+
+    Why this exists: the torch fallback materialises [T, hc, hc, hidden] fp32
+    twice (the comb*residual product and the reduction), plus a buffer for the
+    final add and a cast pass. At hc_mult=4, hidden=4096, T=512 each of those is
+    134 MB, so it moves close to a gigabyte to produce 4 MB of output -- 1.250 ms
+    against a 0.078 ms bandwidth floor, and it is the largest single attributed
+    line in a chunked-prefill profile. This kernel reads x and residual once,
+    writes the output once, and hits the floor (0.073 ms measured, 17.0x).
+    """
+    T, hidden = x.shape
+    hc = residual.shape[1]
+    out = torch.empty_like(residual)
+    BLOCK_H = 256
+    grid = (triton.cdiv(hidden, BLOCK_H), T)
+    _hc_post_small_hc_kernel[grid](
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        out,
+        hidden,
+        x.stride(0),
+        residual.stride(0),
+        post_layer_mix.stride(0),
+        comb_res_mix.stride(0),
+        out.stride(0),
+        HC=hc,
+        BLOCK_H=BLOCK_H,
+        num_warps=4,
+        num_stages=1,
+    )
+    return out
+
+
 def mhc_post(
     x: torch.Tensor,
     residual: torch.Tensor,

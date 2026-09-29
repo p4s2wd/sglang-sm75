@@ -106,7 +106,15 @@ def hpc_bf16xfp32_gemm_enabled() -> bool:
 
 
 def _linear_bf16_fp32_cublas(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    if x.is_cuda and x.dtype == torch.bfloat16 and y.dtype == torch.bfloat16:
+    # torch.mm's out_dtype kwarg gives a 16-bit tensor-core GEMM with fp32
+    # accumulate and fp32 output. It takes float16 as well as bfloat16, which
+    # matters on sub-90: those GPUs have no bfloat16 and the model runs in
+    # float16, so the bf16-only test below used to miss and fall through to
+    # torch.mm(x.float(), y.float().t()) -- a fresh fp32 copy of the weight on
+    # every call plus a GEMM SM75 has no tensor cores for. Measured on a
+    # 2080 Ti at router shapes (N=384, K=4096, M=1): 61.5us -> 30.5us, 2.01x,
+    # max relative error 2.1e-4 against the fp32 reference.
+    if x.is_cuda and x.dtype == y.dtype and y.dtype in (torch.bfloat16, torch.float16):
         return torch.mm(x, y.t(), out_dtype=torch.float32)
     return torch.mm(x.float(), y.float().t())
 

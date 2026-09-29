@@ -454,7 +454,14 @@ def commit_kv_proj_fused(
             bias=None,
         )
     else:
-        kv_all = torch.nn.functional.linear(main_x, stacked.weight)
+        # _dequant_linear_weight widens to bf16, but the activation dtype is the
+        # model's own -- on the SM75 stack that is fp16, and F.linear rejects a
+        # Half @ BFloat16 mix. Match the activation, which is what the non-fused
+        # commit_kv_proj path effectively does by calling each linear directly.
+        w = stacked.weight
+        if w.dtype != main_x.dtype:
+            w = w.to(main_x.dtype)
+        kv_all = torch.nn.functional.linear(main_x, w)
 
     head_dim = kv_all.shape[-1] // num_stages
     slices = list(kv_all.split(head_dim, dim=-1))
@@ -480,6 +487,15 @@ def _block_quant_stack_applies(*, wkv_linears: list[torch.nn.Module]) -> bool:
     quant_method = wkv_linears[0].quant_method
     block_quant = hasattr(quant_method, "block_quant") and quant_method.block_quant
     if not (block_quant and hasattr(quant_method, "w8a8_block_fp8_linear")):
+        return False
+    # The stacked path calls w8a8_block_fp8_linear directly, which compiles a
+    # Triton kernel using the fp8e4nv type. Pre-SM80 parts have no such type
+    # ("type fp8e4nv not supported in this architecture"), and on those parts the
+    # linear layers keep an FP8 payload that our W8A16 kernel dequantizes in
+    # registers -- so the weights look stackable while the kernel behind them
+    # cannot even compile. Declining here routes the caller to
+    # _dequant_linear_weight, which widens to bf16 once at build time.
+    if getattr(quant_method, "sub80_dequant", False):
         return False
     block_out = quant_method.quant_config.weight_block_size[0]
     return all(

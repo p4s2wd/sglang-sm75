@@ -1,6 +1,7 @@
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import libdevice
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.utils import is_hip
@@ -580,3 +581,189 @@ def fused_gate_sigmoid_mul_add(
         final_hidden_states,
         do_add=True,
     )
+
+
+@triton.jit
+def _moe_swiglu_clamp_kernel(
+    src_ptr,  # [rows, 2*INTER] fp16, gate in [:INTER], up in [INTER:]
+    dst_ptr,  # [rows, INTER] fp16
+    src_stride,  # row stride of src, in elements
+    dst_stride,  # row stride of dst, in elements
+    INTER,
+    LIMIT,  # <= 0 disables the clamp
+    HAS_LIMIT: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Fused gate/up split, SiLU, clamp and multiply for the MoE activation.
+
+    Replaces seven torch kernels -- chunk (two strided views), silu on a fp32 cast,
+    two clamps, a multiply and a cast back -- which cost 20 us of device time at the
+    decode shape (96 rows x 2048) against a ~1 us bandwidth floor. Two of the seven run
+    on the non-vectorized elementwise path (8.8 us for the pair) because chunk() hands
+    out strided views, so torch cannot prove the inner dimension is contiguous.
+
+    The arithmetic is deliberately the same order as the torch code it replaces:
+    silu in fp32, clamp silu's result, clamp up in fp32, multiply in fp32, cast to fp16
+    once at the end. Doing the multiply in fp16, or clamping before silu, would change
+    the bits.
+    """
+    row = tl.program_id(0)
+    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < INTER
+    src = src_ptr + row.to(tl.int64) * src_stride
+    gate = tl.load(src + offs, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(src + INTER + offs, mask=mask, other=0.0).to(tl.float32)
+    # libdevice.exp, not tl.exp. tl.exp lowers to ex2.approx and lands a few fp32 ulp
+    # off torch's silu on 34% of the fp16 grid; __nv_expf is the accurate expf that
+    # torch's own CUDA kernel calls, and with it the fp16 result differs on 1 value out
+    # of all 44160 finite fp16 magnitudes below 100. The remaining difference is a
+    # single rounding tie, not a systematic bias.
+    act = gate * (1.0 / (1.0 + libdevice.exp(-gate)))
+    if HAS_LIMIT:
+        act = tl.minimum(act, LIMIT)
+        up = tl.minimum(tl.maximum(up, -LIMIT), LIMIT)
+    out = (act * up).to(dst_ptr.dtype.element_ty)
+    tl.store(dst_ptr + row.to(tl.int64) * dst_stride + offs, out, mask=mask)
+
+
+def moe_swiglu_clamp(src: torch.Tensor, limit=None, out: torch.Tensor = None):
+    """out = (silu(gate).clamp(max=limit) * up.clamp(-limit, limit)).half().
+
+    `src` is [rows, 2*INTER] with gate first, matching the w13 output where the two
+    halves are concatenated along the last dim. `limit` None skips both clamps.
+    """
+    rows, inter2 = src.shape
+    inter = inter2 // 2
+    # The kernel indexes within a row as src + row*stride(0) + col, so it assumes the
+    # inner dimension is dense. A stride(1) != 1 input is not something Triton would
+    # catch: it reads the wrong elements and returns plausible-looking numbers, which
+    # measured 98300 of 98304 wrong before this check. Copy instead of failing, since a
+    # strided input is a legitimate thing for a caller to hand over.
+    if src.stride(1) != 1:
+        src = src.contiguous()
+    if out is not None and out.stride(1) != 1:
+        raise ValueError("moe_swiglu_clamp: out must be dense along its last dim")
+    if out is None:
+        out = torch.empty((rows, inter), dtype=src.dtype, device=src.device)
+    BLOCK = min(triton.next_power_of_2(inter), 2048)
+    _moe_swiglu_clamp_kernel[(rows, triton.cdiv(inter, BLOCK))](
+        src,
+        out,
+        src.stride(0),
+        out.stride(0),
+        inter,
+        0.0 if limit is None else float(limit),
+        HAS_LIMIT=limit is not None,
+        BLOCK=BLOCK,
+        num_warps=8 if BLOCK >= 1024 else 4,
+    )
+    return out
+
+
+@triton.jit
+def _moe_combine_kernel(
+    down_ptr,  # [num_slots, HIDDEN] fp16, one row per padded slot
+    sorted_ptr,  # [num_slots] int32, the (token*topk + k) each slot belongs to
+    weight_ptr,  # [num_tokens*TOPK] fp32 routing weights
+    out_ptr,  # [num_tokens, HIDDEN] output dtype
+    num_valid_ptr,  # [1] int32, live slot count, read on the device
+    num_slots,  # host int: the padded range, which live slots are scattered over
+    down_stride,
+    out_stride,
+    TOPK: tl.constexpr,
+    SCALE,
+    HAS_SCALE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Weighted sum over topk of the routed-expert outputs, in one kernel.
+
+    The torch version materialises a [num_tokens*topk+1, HIDDEN] fp16 buffer, scatters
+    into it with index_copy_, slices and views it as [tokens, topk, hidden], casts the
+    whole thing to fp32, multiplies by the routing weights and reduces over topk. That
+    is 13 kernels and 30.6 us of device time at the decode shape against a ~1 us floor.
+
+    Each program owns one (token, hidden block) and walks the padded slots, accumulating
+    the rows whose owner is this token. The test is on a scalar, so a non-matching slot
+    costs one compare and no load, and the traffic is exactly topk rows per token.
+    num_valid is read from the device rather than passed as a value so the launch stays
+    capturable in a CUDA graph.
+
+    Accumulation is fp32 with one cast at the end, matching the torch order: fp32
+    multiply, fp32 sum over topk, then cast to the output dtype.
+    """
+    tok = tl.program_id(0)
+    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    num_valid = tl.load(num_valid_ptr)
+    lo = tok * TOPK
+    hi = lo + TOPK
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for s in range(0, num_slots):
+        owner = tl.load(sorted_ptr + s)
+        # Invalid means the pad sentinel or a position at or past num_valid, where
+        # sorted_ids is uninitialised and would otherwise index outside the output.
+        if (owner >= lo) & (owner < hi) & (s < num_valid):
+            w = tl.load(weight_ptr + owner)
+            v = tl.load(down_ptr + s.to(tl.int64) * down_stride + offs)
+            acc += w * v.to(tl.float32)
+    if HAS_SCALE:
+        acc = acc * SCALE
+    tl.store(
+        out_ptr + tok.to(tl.int64) * out_stride + offs, acc.to(out_ptr.dtype.element_ty)
+    )
+
+
+def moe_combine(
+    down_slots: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_valid: torch.Tensor,
+    num_tokens: int,
+    topk: int,
+    scale=None,
+    out: torch.Tensor = None,
+):
+    """out[t] = sum over the topk slots owned by t of weight * down_slots[slot].
+
+    `sorted_ids` gives each padded slot its owner as t*topk + k; slots at or past
+    `num_valid` and slots holding the pad sentinel contribute nothing. The sentinel is
+    num_tokens*topk, which is above every valid owner, so the owner range test rejects it
+    without a separate comparison. `topk_weights` is indexed flat as t*topk + k.
+    """
+    num_slots, hidden = down_slots.shape
+    if down_slots.stride(1) != 1:
+        down_slots = down_slots.contiguous()
+    # Indexed flat as t*topk + k, so a non-contiguous weight tensor would be read in
+    # the wrong order. Cheap to check and it fails loudly rather than silently.
+    if topk_weights.stride(0) != topk:
+        topk_weights = topk_weights.contiguous()
+    topk_weights = topk_weights.reshape(-1)
+    if out is None:
+        out = torch.empty(
+            (num_tokens, hidden), dtype=down_slots.dtype, device=down_slots.device
+        )
+    # 512 measured best or within 2% of best at one, two and eight tokens. Smaller
+    # blocks add programs but each still scans every padded slot, so the win is small;
+    # larger ones leave the SMs idle at the decode batch sizes this path serves.
+    BLOCK = min(triton.next_power_of_2(hidden), 512)
+    if hidden % BLOCK != 0:
+        # The kernel issues one masked-free load per block, so a remainder would be
+        # dropped rather than masked. Fall back to a block that divides hidden.
+        BLOCK = next(
+            (b for b in (256, 128, 64, 32, 16, 8, 4, 2, 1) if hidden % b == 0), 1
+        )
+    _moe_combine_kernel[(num_tokens, hidden // BLOCK)](
+        down_slots,
+        sorted_ids,
+        topk_weights,
+        out,
+        num_valid,
+        num_slots,
+        down_slots.stride(0),
+        out.stride(0),
+        TOPK=topk,
+        SCALE=1.0 if scale is None else float(scale),
+        HAS_SCALE=scale is not None,
+        BLOCK=BLOCK,
+        num_warps=2 if BLOCK <= 512 else 4,
+    )
+    return out

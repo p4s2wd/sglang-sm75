@@ -418,6 +418,20 @@ if _wo_a_aiter_batched_gemm_enabled:
 # instead of re-raising (and re-logging) on every layer/token.
 _wo_a_aiter_batched_gemm_disabled = False
 
+# Fused wo_a absorb for the batch sizes where a batched cuBLAS GEMM is slower than a
+# streaming Triton kernel. Measured on a 2080 Ti at G=4, R=1024, D=4096; see
+# _apply_wo_a_bf16_matmul for the curve. 8 leaves margin before the 12-token crossover
+# and covers decode at the batch sizes this deployment serves.
+_WO_A_FUSED_MAX_T = 8
+
+try:
+    from sglang.kernels.ops.quantization.fp8_w8a16 import wo_a_absorb as _wo_a_absorb
+
+    _WO_A_FUSED_ABSORB = True
+except Exception:  # pragma: no cover - Triton missing or too old
+    _wo_a_absorb = None
+    _WO_A_FUSED_ABSORB = False
+
 # ROCm fp8 wo_a. The CUDA fp8 path below is built on DeepGEMM's fp8_einsum, so
 # gfx950 runs the equivalent aiter e8m0 block-scale batched GEMM instead. Both
 # the kernel availability and the weight-scale converter resolve once at import;
@@ -460,6 +474,38 @@ def _apply_wo_a_bf16_matmul(
     is_prefill: bool = False,
     fast_path: bool = False,
 ) -> torch.Tensor | Mxfp8SwizzledInput:
+    """wo_a (attn output -> o_proj low-rank) bf16 batched matmul.
+
+    ``o`` is ``[T, G, D]`` (tokens, groups, head_dim) and ``wo_a`` is
+    ``[G, R, D]`` (groups, o_lora_rank, head_dim); the result is ``[T, G, R]``.
+
+    Dispatch contract: on the decode path, when the reroute is enabled
+    (``_wo_a_aiter_batched_gemm_enabled``, computed once at import) and has not
+    been disabled by a prior runtime failure, call the pre-imported aiter
+    ``batched_gemm_bf16`` (``Y[i] = X[i] @ W[i]^T``). Otherwise -- prefill, any
+    gate off, or after a failure -- use the numerically-equivalent
+    ``torch.einsum("tgd,grd->tgr", ...)``. The first runtime kernel failure
+    disables the reroute for the process (logged once).
+    """
+    # SM75 fused absorb. torch.einsum("tgd,grd->tgr") reads the [G,R,D] weight at the
+    # card's read-only ceiling for one token (61.3 us, 548 GB/s) and then collapses to
+    # 168 GB/s from two tokens up -- 199.6 us, flat through T=8 -- because cuBLAS changes
+    # algorithm. The Triton kernel holds 546 GB/s at two tokens, so decode pays 61 us per
+    # layer instead of 200 us: 1.53 ms per token over the 11 layers a stage holds.
+    #
+    # It loses past T=12 because it carries four fp32 register accumulators per program
+    # and re-reads the weight for each chunk of four tokens, while einsum reads it once.
+    # From T=16 up einsum wins, and by T=64 it is faster still -- Turing has fp16 tensor
+    # cores, so once the projection is compute bound the batched GEMM is the right call.
+    # Hence the gate on token count rather than on is_decode.
+    if (
+        _WO_A_FUSED_ABSORB
+        and o.shape[0] <= _WO_A_FUSED_MAX_T
+        and o.dtype in (torch.float16, torch.bfloat16)
+        and wo_a.dtype == o.dtype
+    ):
+        return _wo_a_absorb(o, wo_a)
+
     # o [T, G, D] @ wo_a [G, R, D] -> [T, G, R]; the fast paths below are gated
     # on the exact validated TP4 shapes and write token-major output directly.
     global _wo_a_aiter_batched_gemm_disabled
@@ -878,7 +924,10 @@ class MqaAttentionBase(nn.Module):
             prefix=add_prefix("wo_a", prefix),
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
-            **({} if quantize_wo_a else {"params_dtype": torch.bfloat16}),
+            # Unquantized wo_a follows the model dtype rather than being pinned to
+            # bf16: on sub-90 the model runs fp16 (no native bf16) and a bf16
+            # weight fails the matmul dtype check. bf16 machines are unchanged.
+            **({} if quantize_wo_a else {"params_dtype": torch.get_default_dtype()}),
         )
         if quantize_wo_a:
             assert hasattr(self.wo_a, "weight_scale_inv"), (
@@ -2990,6 +3039,17 @@ class DeepseekV4DecoderLayer(nn.Module):
             result = torch.empty_like(residual)
             mhc_post(result, x, residual, post, comb)
             return result
+
+        # Sub-80 (Turing/Ampere without TileLang coverage) falls through to the
+        # torch expression below, which is not a placeholder: it materialises
+        # [T, hc_mult, hc_mult, hidden] fp32 twice. At hc_mult=4, hidden=4096 and
+        # a 512-token prefill chunk that is ~1 GB of traffic for 4 MB of output,
+        # and it is the largest single attributed line in the prefill profile.
+        # The Triton kernel does the same math at the bandwidth floor (17x).
+        if _is_cuda and self.hc_mult == 4 and envs.SGLANG_SM75_FUSED_HC_POST.get():
+            from sglang.kernels.ops.layernorm.mhc import mhc_post_triton
+
+            return mhc_post_triton(x, residual, post, comb)
 
         assert residual.shape == (x.shape[0], self.hc_mult, x.shape[-1])
         assert post.shape == (x.shape[0], self.hc_mult)
@@ -5813,7 +5873,8 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         weight_f32 * scale.float()[:, None, :, None], "sn bn sk bk -> (sn bn) (sk bk)"
     )
 
-    return result.to(torch.bfloat16)
+    # Match the model dtype: fp16 on sub-80 (no native bf16), bf16 elsewhere.
+    return result.to(torch.get_default_dtype())
 
 
 def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:

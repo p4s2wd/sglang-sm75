@@ -22,8 +22,14 @@ if _is_xpu:
 
 
 @cache_once
-def _jit_fused_rope_module():
-    args = make_cpp_args(is_arch_support_pdl())
+def _jit_fused_rope_module(dtype: torch.dtype):
+    """RoPE kernel, compiled for `dtype`.
+
+    The kernel rotates q and k in place, so both must share this dtype. It used
+    to be hardcoded to bf16, which broke sub-90 (SM75/SM80) where the model
+    runs in fp16 for lack of bf16 tensor cores.
+    """
+    args = make_cpp_args(dtype, is_arch_support_pdl())
     return load_jit(
         make_name("fused_rope"),
         *args,
@@ -162,8 +168,13 @@ def fused_rope_inplace(
             apply_rotary_emb_triton(k, freqs_cis, positions=positions, inverse=inverse)
         return
 
+    if k is not None and k.dtype != q.dtype:
+        raise ValueError(
+            f"fused_rope_inplace rotates q and k with one kernel; got "
+            f"q={q.dtype} k={k.dtype}"
+        )
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
-    module = _jit_fused_rope_module()
+    module = _jit_fused_rope_module(q.dtype)
     module.forward(q, k, freqs_real, positions, inverse)
 
 

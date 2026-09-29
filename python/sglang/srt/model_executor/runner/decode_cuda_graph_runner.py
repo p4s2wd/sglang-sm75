@@ -98,6 +98,7 @@ from sglang.srt.model_executor.runner_utils.buffers import (
 from sglang.srt.model_executor.runner_utils.capture_mode import (
     _set_capture_attention_variant,
     _set_capture_lora_variant,
+    _set_capture_seq_len_bucket,
     model_capture_mode,
 )
 from sglang.srt.model_executor.runner_utils.deepep_adapter import (
@@ -570,13 +571,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return torch.int64
 
     def _make_graph_key(
-        self, size, stream_idx=None, variant_label=None, attention_variant=None
+        self,
+        size,
+        stream_idx=None,
+        variant_label=None,
+        attention_variant=None,
+        seq_len_bucket=None,
     ):
         return ShapeKey(
             size=size,
             stream_idx=stream_idx,
             variant_label=variant_label,
             attention_variant=attention_variant,
+            seq_len_bucket=seq_len_bucket,
         )
 
     def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int:
@@ -592,6 +599,34 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _resolve_attention_variant(self, forward_batch: ForwardBatch) -> Optional[str]:
         variants = self.attention_graph_variants
         return variants.select(forward_batch) if variants is not None else None
+
+    def _resolve_seq_len_bucket(self, forward_batch: ForwardBatch) -> Optional[int]:
+        """Pick which per-length decode graph to replay, from the batch's longest
+        sequence. Same host-side dispatch as _resolve_attention_variant:
+        seq_lens_cpu is a mirror the scheduler maintains, so this costs no
+        device sync.
+
+        Returns None when the backend does not bucket (every other model), which is
+        also the key the single graph was captured under.
+        """
+        # Ask the backend that will actually replay: under pdmux each stream has
+        # its own backend instance and it, not self.attn_backend, is the one that
+        # declared the buckets.
+        buckets = getattr(self._replay_attn_backend(), "decode_seq_len_buckets", [])
+        if not buckets:
+            return None
+        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
+            max_kv_len = int(seq_lens_cpu.max().item())
+        elif forward_batch.seq_lens is not None and forward_batch.seq_lens.numel() > 0:
+            max_kv_len = int(forward_batch.seq_lens.max().item())
+        else:
+            # No length info: the widest bucket is the only correct-for-all choice.
+            return buckets[-1]
+        for b in buckets:
+            if max_kv_len <= b:
+                return b
+        return buckets[-1]
 
     def _resolve_lora_variant(self, forward_batch: ForwardBatch):
         if not self.record_nolora_graph:
@@ -706,6 +741,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             variant_label=self._resolve_lora_variant(forward_batch),
             attention_variant=(
                 self._resolve_attention_variant(forward_batch)
+                if self.disable_padding
+                else None
+            ),
+            # Graphs are captured per KV-width bucket, so the key that is looked
+            # up in the backend has to carry the same bucket the graph was
+            # captured under.
+            seq_len_bucket=(
+                self._resolve_seq_len_bucket(forward_batch)
                 if self.disable_padding
                 else None
             ),
@@ -1110,6 +1153,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         attention_variants = (
             variants.capture_labels if variants is not None else (None,)
         )
+        # DeepSeek-V4 sizes the indexer's logits row from the max_seq_len fixed at
+        # capture time, so one graph per context length makes a short request scan
+        # the whole context every step. The backend publishes the widths worth
+        # capturing; every other model returns [] and keeps the single graph.
+        seq_len_buckets = getattr(self.attn_backend, "decode_seq_len_buckets", []) or [
+            None
+        ]
         for bs in capture_range:
             if get_parallel().tp_rank == 0:
                 avail_mem = get_available_gpu_memory(
@@ -1125,20 +1175,24 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 _set_capture_lora_variant(variant_label)
                 for attention_variant in attention_variants:
                     _set_capture_attention_variant(attention_variant)
-                    with torch_compile_decoration.patch_model(
-                        self.model_runner.model,
-                        bs in self.compile_bs,
-                        num_tokens=bs * self.captured_req_width,
-                        tp_group=self.model_runner.tp_group,
-                    ) as forward:
-                        self.capture_one_shape(
-                            bs,
-                            forward,
-                            stream_idx,
-                            variant_label,
-                            attention_variant,
-                        )
+                    for seq_len_bucket in seq_len_buckets:
+                        _set_capture_seq_len_bucket(seq_len_bucket)
+                        with torch_compile_decoration.patch_model(
+                            self.model_runner.model,
+                            bs in self.compile_bs,
+                            num_tokens=bs * self.captured_req_width,
+                            tp_group=self.model_runner.tp_group,
+                        ) as forward:
+                            self.capture_one_shape(
+                                bs,
+                                forward,
+                                stream_idx,
+                                variant_label,
+                                attention_variant,
+                                seq_len_bucket=seq_len_bucket,
+                            )
         _set_capture_attention_variant(None)
+        _set_capture_seq_len_bucket(None)
 
     def capture_one_shape(
         self,
@@ -1147,6 +1201,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
         attention_variant: Optional[str] = None,
+        seq_len_bucket: Optional[int] = None,
     ):
         num_tokens = size * self.captured_req_width
         bs = self._ragged_capture_slots(num_tokens) if self.ragged_verify_mode else size
@@ -1241,6 +1296,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     stream_idx,
                     variant_label,
                     attention_variant,
+                    seq_len_bucket,
                 )
                 # Adaptive runners may own a different backend than model_runner.
                 post_warmup_hook = getattr(
@@ -1333,9 +1389,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
             variant_label = self._resolve_lora_variant(forward_batch)
             attention_variant = self._resolve_attention_variant(forward_batch)
+            seq_len_bucket = self._resolve_seq_len_bucket(forward_batch)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
             self._replay_graph_key = self._make_graph_key(
-                graph_size_key, stream_idx, variant_label, attention_variant
+                graph_size_key,
+                stream_idx,
+                variant_label,
+                attention_variant,
+                seq_len_bucket,
             )
             return
 
@@ -1426,6 +1487,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.lora_manager.prepare_lora_batch(
                 cast(ForwardBatch, fb_view)
             )
+        # The graph being replayed was captured for one KV-length bucket, and the
+        # backend must rebuild its metadata with that same width or the page-table
+        # view it hands the kernels will not match the one baked into the graph.
+        fb_view.seq_len_bucket = self._resolve_seq_len_bucket(forward_batch)
         # Glue-graph fast path: pointer-stable prep (static buffers + pool
         # tensors only) is captured per key; guards keep every python-visible
         # branch inside the backends constant for that key.
@@ -1450,6 +1515,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     bs,
                     str(self.capture_forward_mode),
                     str(fb_view.actual_forward_mode),
+                    # The KV-width bucket changes the page-table slice the prep
+                    # builds, so it is a different python branch and needs its own
+                    # captured glue graph. Without it two buckets of the same bs
+                    # would share one graph and one of them would get the other's
+                    # width.
+                    fb_view.seq_len_bucket,
                 ),
             )
         else:
@@ -1466,9 +1537,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         variant_label = self._resolve_lora_variant(forward_batch)
         attention_variant = self._resolve_attention_variant(forward_batch)
+        seq_len_bucket = self._resolve_seq_len_bucket(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
-            graph_size_key, stream_idx, variant_label, attention_variant
+            graph_size_key,
+            stream_idx,
+            variant_label,
+            attention_variant,
+            seq_len_bucket,
         )
 
     def _ragged_graph_num_tokens(self, total_verify_tokens: int) -> int:
@@ -1491,10 +1567,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.load_batch(forward_batch, pp_proxy_tensors)
             if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
                 logger.info(
-                    "Decode graph replay: worker=%s key_size=%s (%s) mode=%s raw_bs=%d%s",
+                    "Decode graph replay: worker=%s key_size=%s (%s) "
+                    "seq_len_bucket=%s mode=%s raw_bs=%d%s",
                     "draft" if self.model_runner.is_draft_worker else "target",
                     self._replay_graph_key.size,
                     "num_tokens" if self.ragged_verify_mode else "bs",
+                    self._replay_graph_key.seq_len_bucket,
                     forward_batch.forward_mode.name,
                     forward_batch.batch_size,
                     (

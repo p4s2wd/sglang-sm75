@@ -1099,6 +1099,81 @@ class Envs:
     # Store DeepSeek-V4 SWA KV directly in FlashInfer's 64-token SM120 page
     # layout. The scheduler continues to allocate 256-token logical pages.
     SGLANG_OPT_SM120_DIRECT_SWA_KV = EnvBool(False)
+    # Repack sub-90 MXFP4 expert weights into the PTX lane-major layout at load
+    # time, which enables the 1.35-1.59x repacked GEMM. The repack is a
+    # permutation of the same bytes done one expert at a time, so it costs no
+    # steady-state memory. Set false to keep the raw checkpoint layout and use
+    # the direct-layout kernel.
+    SGLANG_SM75_W4A16_REPACK = EnvBool(True)
+    # n-tiles-per-warp for the v3 W4A16 expert kernel: 0 keeps the shipped
+    # single-tile kernel, 2 and 4 make one warp own that many consecutive n tiles
+    # so the m16n8k8 activation fragments are loaded once per k step instead of
+    # once per tile, and swaps the arithmetic nibble decoder for a PRMT byte
+    # lookup. Measured on the decode shape: 4 gives 1.73x at 6 active experts and
+    # 1.81x at 48, bit-equal to the shipped kernel after normalising -0.0 (the
+    # PRMT path keeps e2m1's negative zero, the arithmetic path discards it).
+    # End to end that is +25% prefill and +13% decode at batch 8. 0 keeps the
+    # shipped kernel and is the A/B switch.
+    SGLANG_SM75_W4A16_V3_NT = EnvInt(4)
+    # Split the W4A16 k reduction across grid.z to raise the block count. 1 disables
+    # it and is the A/B switch; 2 requests cfg=7 (NT4 KS2) and is the default.
+    #
+    # Decode is occupancy-starved. At the production shape the grid is 64 x 6 = 384
+    # working blocks on 68 SMs, 5.6 warps per SM, and a block-count sweep of the same
+    # kernel with identical bytes per block gives 202 GB/s at 384 blocks against 337 at
+    # 1536 and 388 at 6144. The kernel sits at a third of every resource ceiling at once
+    # (DRAM 616, tensor core 955, instruction issue 879, latency 709), which is the
+    # signature of too few loads in flight rather than of a saturated pipe.
+    #
+    # Splitting k doubles the blocks without re-reading a weight byte or an activation
+    # fragment. Median of 7 interleaved rounds at the real bs=1 shapes on a 2080 Ti:
+    #   gemm1  0.116 -> 0.087 ms   217 -> 289 GB/s   1.33x
+    #   gemm2  0.060 -> 0.048 ms   210 -> 264 GB/s   1.26x
+    # The wrapper refuses the split above 448 blocks, where it measures 1.00x and worse,
+    # so every batch size from 2 up and all of prefill take the unsplit launch.
+    #
+    # The combining reduce is fused into the same module and reads num_valid on the
+    # device, so it touches only live rows. That matters: torch.sum over the partial
+    # buffer walks its full capacity, and at the larger batch sizes the align buffer's
+    # capacity is thousands of rows against a few live ones, which would move as much
+    # traffic as the GEMM itself.
+    SGLANG_SM75_W4A16_KSPLIT = EnvInt(2)
+    # Batch size at or above which the head-shared sparse-attention kernel takes
+    # over from the per-head one. 0 disables head-sharing entirely, which is the
+    # A/B switch for measuring it end to end.
+    #
+    # 1, not 2: the head-shared kernel amortizes each KV gather over BLOCK_H=16 heads,
+    # and MLA shares one KV entry across all 64 heads, so it is flat in batch while the
+    # per-head kernel re-gathers the same block once per head. It used to lose at bs=1,
+    # where it has B*H/16 = 4 blocks against the per-head kernel's B*H = 64 and each
+    # block walks all 32 tiles serially -- that is why the threshold was 2, and the
+    # isolation numbers were right: at 86K context, bs=1, unsplit, head-shared measured
+    # 8.63 tok/s against the per-head kernel's 11.00.
+    #
+    # Splitting the topk loop across grid.z (SGLANG_SM75_HS_TOPK_SPLIT) removes the
+    # serial tile walk, and the split count is derived from the block budget so bs=1
+    # gets 16-way parallelism. Re-measured end to end at 86K context, TP2/PP4, 150 W:
+    # head-shared with 16 splits gives 13.55 tok/s against per-head's 11.00 (+23%),
+    # median of 3 with no overlap between arms. So the kernel now wins at every batch
+    # size and the threshold drops to 1.
+    SGLANG_SM75_HEADSHARED_MIN_BATCH = EnvInt(1)
+    # Fused Triton mhc_post for hc_mult==4. The torch fallback materialises
+    # [T, hc_mult, hc_mult, hidden] fp32 twice, which at hidden=4096 and a 512-token
+    # prefill chunk is ~1 GB of traffic for 4 MB of output. 0 disables it.
+    SGLANG_SM75_FUSED_HC_POST = EnvInt(1)
+    # Comma-separated KV widths to capture a decode CUDA graph for, in addition to
+    # the context length. DeepSeek-V4 fixes the indexer's logits-row width at
+    # capture time, so a single graph captured at the full context length makes an
+    # 11-token request scan every column of that context on every step: on a 2080
+    # Ti at 256K context that costs 34% of decode throughput.
+    #
+    # Default on, because the cost is only paid by requests that stay under the
+    # bucket. The context length is always appended to the list, so anything longer
+    # replays the full-width graph exactly as before, and a mis-picked bucket can
+    # only ever be too narrow, which the existing
+    # `assert actual_max_seq_len <= chosen_max_seq_len` turns into a crash rather
+    # than silently dropped context. Set empty to disable (one graph per batch size).
+    SGLANG_DSV4_DECODE_SEQ_LEN_BUCKETS = EnvStr("8192")
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
@@ -1524,6 +1599,11 @@ class Envs:
     # Model and Quantization
     # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint.
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
+    # Set True to bypass the get_min_capability() gate for GPUs below SM80
+    # (e.g. SM75/Turing). The sub-80 quant paths are community-maintained:
+    # loading proceeds with W8A16/W4A16 dequant fallbacks instead of raising,
+    # and accuracy/perf are not covered by upstream verification.
+    SGLANG_ALLOW_SUB80_QUANT = EnvBool(False)
     # Set True to dequantize the FP4 experts to FP8 at runtime
     SGLANG_DSV4_FP4_DEQUANT = EnvBool(False)
     # Flash-0731 also accepts "low"; the active profile is checkpoint-resolved.

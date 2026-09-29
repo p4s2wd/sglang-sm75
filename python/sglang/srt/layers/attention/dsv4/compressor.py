@@ -358,7 +358,22 @@ class Compressor(BaseFusedOp):
             torch.empty(self.ratio, coff * self.head_dim, dtype=torch.float32)
         )
         set_weight_attrs(self.ape, {"weight_loader": self.load_ape_weight})
-        wkv_gate_dtype = torch.bfloat16
+        # Match the model's compute dtype instead of hardcoding bfloat16. The
+        # checkpoint stores wkv/wgate as bf16, but on GPUs without bf16 math (sub-90,
+        # where the model runs float16) a bf16 weight forces linear_bf16_fp32 into its
+        # fallback branch, torch.mm(x.float(), y.float().t()), which copies the whole
+        # weight to fp32 on every call. That fallback is not merely slow here, it is
+        # unavoidable: torch.mm with bf16 inputs and fp32 output raises "only supported
+        # for CUDA devices with compute capability 8.0 or higher", so while the weight
+        # stays bf16 the fast path cannot be reached at all on SM75.
+        # Measured on a 2080 Ti at the compressor shape (N=1024, K=4096, M=1): 64.3 us
+        # with the per-call fp32 copy vs 36.4 us for fp16 x fp16 -> fp32, 1.77x.
+        # torch.get_default_dtype() is set from the model dtype during load
+        # (model_loader/utils.py:28), so this stays bf16 on normal hardware -- unchanged
+        # behaviour there -- and becomes fp16 on sub-90. Range is safe: across all 124
+        # compressor wkv/wgate tensors the largest magnitude is 4.84 (fp16 max 65504)
+        # and 287 of 304M elements flush to zero in fp16 (9.4e-05%).
+        wkv_gate_dtype = torch.get_default_dtype()
         self.wkv_gate = ReplicatedLinear(
             self.dim,
             2 * coff * self.head_dim,

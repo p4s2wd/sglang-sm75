@@ -3,6 +3,7 @@ from __future__ import annotations
 import enum
 import functools
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -133,6 +134,25 @@ if TYPE_CHECKING:
 _is_cuda = is_cuda()
 _is_xpu = is_xpu()
 
+
+def _use_torch_sparse_mla() -> bool:
+    """Whether the sm120 torch/Triton sparse-MLA implementation serves this GPU.
+
+    SM120 (no sgl_kernel flash_mla) and sub-90 (SM75/SM80: no FP8/FP4 tensor
+    cores, no sgl_kernel flash_mla build) both route through the pure-PyTorch
+    sparse decode in kernels/ops/attention/flash_mla_sm120.py, which
+    dequantizes the FP8 paged KV in software.
+    """
+    if get_platform().is_sm120:
+        return True
+    if _is_cuda:
+        import torch
+
+        major, _minor = torch.cuda.get_device_capability()
+        return major < 9
+    return False
+
+
 logger = logging.getLogger(__name__)
 
 SWA_WINDOW = 128
@@ -185,7 +205,7 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 
 
 def _create_flashmla_metadata():
-    if get_platform().is_sm120 or _is_xpu:
+    if get_platform().is_sm120 or _is_xpu or _use_torch_sparse_mla():
         return None
     import sgl_kernel.flash_mla as flash_mla
 
@@ -1036,11 +1056,39 @@ class DSV4RawDecodeMetadata:
     req_pool_indices: torch.Tensor
     seq_lens: torch.Tensor
     out_cache_loc: torch.Tensor
+    # KV width this graph was captured for. The upgrade to full metadata slices the
+    # page table with it, so it has to travel with the raw tensors rather than
+    # being read back off a backend-wide constant -- two graphs of the same batch
+    # size differ only in this.
+    max_seq_len: Optional[int] = None
 
     def copy_(self, other: DSV4RawDecodeMetadata):
         self.req_pool_indices.copy_(other.req_pool_indices)
         self.seq_lens.copy_(other.seq_lens)
         self.out_cache_loc.copy_(other.out_cache_loc)
+
+
+def _parse_seq_len_buckets(spec: str, context_len: int) -> List[int]:
+    """Parse SGLANG_DSV4_DECODE_SEQ_LEN_BUCKETS into capture widths.
+
+    The list is ascending, deduped, clamped to the context length, and always
+    ends with the context length itself: the widest graph is the only one that is
+    correct for a sequence that reaches the context limit, so dropping it would
+    silently mis-serve long requests.
+    """
+    out = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            v = int(part)
+        except ValueError:
+            continue
+        if v > 0:
+            out.add(min(v, context_len))
+    out.add(context_len)
+    return sorted(out)
 
 
 class _GraphBucket(enum.Enum):
@@ -1136,6 +1184,24 @@ class DeepseekV4AttnBackend(
             token_to_kv_pool=self.token_to_kv_pool, req_to_token=self.req_to_token
         )
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
+        # Decode graphs are captured once per entry of this list (see
+        # decode_seq_len_buckets). While a capture is running, the runner publishes
+        # the bucket being captured and it becomes the width baked into that graph.
+        self.decode_seq_len_buckets: List[int] = []
+        if envs.SGLANG_DSV4_DECODE_SEQ_LEN_BUCKETS.get():
+            self.decode_seq_len_buckets = _parse_seq_len_buckets(
+                envs.SGLANG_DSV4_DECODE_SEQ_LEN_BUCKETS.get(),
+                self.MAX_SEQ_LEN_FOR_CAPTURE,
+            )
+
+        # EXPERIMENT ONLY: cap the width baked into captured graphs. Requests
+        # longer than the cap would get wrong attention (the indexer would scan
+        # fewer columns than the sequence has), so this exists purely to measure
+        # how much the capture-time width costs.
+        _cap = os.environ.get("SGLANG_DSV4_CAPTURE_MAX_SEQ_LEN")
+        if _cap:
+            self.MAX_SEQ_LEN_FOR_CAPTURE = min(self.MAX_SEQ_LEN_FOR_CAPTURE, int(_cap))
+            self.decode_seq_len_buckets = []
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
         self.index_topk = getattr(
@@ -1329,6 +1395,7 @@ class DeepseekV4AttnBackend(
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             out_cache_loc=out_cache_loc,
+            max_seq_len=max_seq_len,
         )
 
     def init_forward_metadata_prefill(
@@ -1901,7 +1968,7 @@ class DeepseekV4AttnBackend(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices,
             seq_lens_casual=seq_lens,
-            max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
+            max_seq_len=raw_metadata.max_seq_len or self.MAX_SEQ_LEN_FOR_CAPTURE,
             out_loc=out_cache_loc,
             need_compress=True,
         )
@@ -2172,6 +2239,25 @@ class DeepseekV4AttnBackend(
         seq_lens = seq_lens[:bs]
         req_pool_indices = req_pool_indices[:bs]
         chosen_max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
+        # Which captured graph this metadata belongs to. Two graphs of the same bs
+        # differ only in width, so the bucket has to be part of the cache key or
+        # they would share one page-table view sized for the other width.
+        graph_bucket: Optional[int] = None
+        if in_capture:
+            # The runner publishes the bucket it is capturing; outside capture the
+            # signal is meaningless, so only read it here.
+            from sglang.srt.model_executor.runner_utils.capture_mode import (
+                get_capture_seq_len_bucket,
+            )
+
+            _b = get_capture_seq_len_bucket()
+        else:
+            # Replay: the runner says which bucket the graph being replayed was
+            # captured for, so the metadata is rebuilt at that same width.
+            _b = getattr(forward_batch, "seq_len_bucket", None)
+        if _b is not None:
+            chosen_max_seq_len = min(chosen_max_seq_len, _b)
+            graph_bucket = _b
         if seq_lens_cpu is not None:
             seq_lens_cpu = seq_lens_cpu[:bs]
             actual_max_seq_len = seq_lens_cpu.max().item()
@@ -2241,7 +2327,7 @@ class DeepseekV4AttnBackend(
                 self.online_c128_mtp.clear()
                 self.forward_metadata = self.cuda_graph_metadata_of_bucket_and_bs[
                     bucket
-                ][graph_key]
+                ][graph_key if graph_bucket is None else (graph_key, graph_bucket)]
                 return
             assert out_cache_loc is not None
             assert num_tokens_v >= len(out_cache_loc), (
@@ -2299,7 +2385,10 @@ class DeepseekV4AttnBackend(
             raise NotImplementedError
 
         self.replay_cuda_graph_metadata_from(
-            bs=graph_key, temp_metadata=temp_metadata, bucket=bucket
+            bs=graph_key,
+            temp_metadata=temp_metadata,
+            bucket=bucket,
+            seq_len_bucket=graph_bucket,
         )
 
         if in_capture:
@@ -2358,7 +2447,7 @@ class DeepseekV4AttnBackend(
         assert isinstance(metadata, DSV4Metadata)
         # The tail never takes the sparse path, so it carries no chunk cache.
         use_sparse_prefill = (
-            not get_platform().is_sm120
+            not _use_torch_sparse_mla()
             and metadata.late_layer_tail is None
             and (
                 num_qo_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
@@ -2611,7 +2700,7 @@ class DeepseekV4AttnBackend(
         self.cuda_graph_metadata_of_bucket_and_bs: Dict[
             _GraphBucket,
             Dict[
-                int,
+                Union[int, Tuple[int, int]],
                 Union[
                     DSV4Metadata,
                     DSV4RawDecodeMetadata,
@@ -2652,11 +2741,15 @@ class DeepseekV4AttnBackend(
             DSV4RawDecodeMetadata,
         ],
         bucket: _GraphBucket,
+        seq_len_bucket: Optional[int] = None,
     ) -> None:
+        # Keyed by (bs, bucket): graphs of the same bs captured for different KV
+        # widths carry differently-sized page-table views and must not share one.
         bucket_metadata = self.cuda_graph_metadata_of_bucket_and_bs[bucket]
-        chosen_metadata = bucket_metadata.get(bs)
+        key = bs if seq_len_bucket is None else (bs, seq_len_bucket)
+        chosen_metadata = bucket_metadata.get(key)
         if chosen_metadata is None:
-            bucket_metadata[bs] = temp_metadata
+            bucket_metadata[key] = temp_metadata
             self.forward_metadata = temp_metadata
             return
         chosen_metadata.copy_(temp_metadata)
@@ -3377,13 +3470,14 @@ class DeepseekV4AttnBackend(
                     f"{extra_indices.shape=}'s last dimension is not aligned to 64"
                 )
 
-            # sparse_prefill_fwd does not support SM120. The tail stays dense: its
-            # window floor lives in swa_page_indices, which the chunk cache ignores.
+            # sparse_prefill_fwd does not support SM120, nor the sub-90 torch sparse
+            # path. The tail stays dense: its window floor lives in swa_page_indices,
+            # which the chunk cache ignores.
             if (
                 forward_batch.forward_mode.is_extend_without_speculative()
-                and not get_platform().is_sm120
                 and self.forward_metadata.late_layer_tail is None
                 and token_to_kv_pool.request_window is None
+                and not _use_torch_sparse_mla()
                 and (
                     q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
                     or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
@@ -3441,7 +3535,7 @@ class DeepseekV4AttnBackend(
                     extra_topk_lengths,
                 )
 
-            if get_platform().is_sm120:
+            if _use_torch_sparse_mla():
                 from sglang.kernels.ops.attention.flash_mla_sm120 import (
                     SM120_DECODE_MAX_TOKENS,
                     flash_mla_with_kvcache_sm120,
@@ -3468,6 +3562,9 @@ class DeepseekV4AttnBackend(
                     extra_indices_in_kvcache=extra_indices,
                     extra_topk_length=extra_topk_lengths,
                 )[0]
+                # The sm120 kernel emits bf16; on sub-90 the model runs fp16.
+                if o.dtype != q.dtype:
+                    o = o.to(q.dtype)
             else:
                 if _is_xpu:
                     from sgl_kernel import flash_mla_with_kvcache

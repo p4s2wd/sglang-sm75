@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
@@ -13,6 +14,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 _is_hip = is_hip()
+logger = logging.getLogger(__name__)
 
 _FLASHINFER_TIE_BREAK_VALUES = {
     "small": 1,
@@ -32,16 +34,45 @@ class DSATopKBackend(Enum):
     TORCH = "torch"
     FLASHINFER = "flashinfer"
 
+    @staticmethod
+    def _arch_supports_sgl_kernel() -> bool:
+        """Whether this GPU can run the JIT top-k kernels at all.
+
+        topk_v1 asks for 68KB of dynamic shared memory per block; SM75 caps a
+        block at 64KB and the opt-in ceiling arrived with SM80, so the launch
+        fails outright with "invalid argument". topk_v2 needs thread-block
+        clusters, which are SM90+.
+        """
+        if not torch.cuda.is_available():
+            return True
+        major, _minor = torch.cuda.get_device_capability()
+        return major is None or major >= 8
+
+    @classmethod
+    def _downgrade_for_arch(cls, backend: DSATopKBackend) -> DSATopKBackend:
+        """Fall back to torch top-k where the requested kernel cannot load."""
+        if backend is DSATopKBackend.SGL_KERNEL and not cls._arch_supports_sgl_kernel():
+            logger.info(
+                "DSA top-k: the sgl-kernel JIT top-k needs shared memory / "
+                "clusters this GPU lacks; using the torch top-k path instead."
+            )
+            return DSATopKBackend.TORCH
+        return backend
+
     @classmethod
     def resolve(cls, model_runner: ModelRunner) -> DSATopKBackend:
         """Resolve the DSA top-k backend for one model runner.
 
         ``--dsa-topk-backend`` selects the target backend, while
         ``--speculative-dsa-topk-backend`` independently selects the draft.
+        An explicit non-default choice is honoured only where the kernel can
+        actually run: on pre-SM80 the sgl-kernel default becomes torch.
         """
         if model_runner.is_draft_worker:
-            return cls(get_spec().speculative_dsa_topk_backend)
-        return cls(get_exec().kernel.dsa_topk_backend)
+            backend = cls(get_spec().speculative_dsa_topk_backend)
+        else:
+            backend = cls(get_exec().kernel.dsa_topk_backend)
+        return cls._downgrade_for_arch(backend)
 
     def is_sgl_kernel(self) -> bool:
         return self == DSATopKBackend.SGL_KERNEL

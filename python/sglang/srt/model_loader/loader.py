@@ -252,12 +252,27 @@ def _get_quantization_config(
                 assert 0 <= minor < 10
                 capability = major * 10 + minor
                 if capability < quant_config.get_min_capability():
-                    raise ValueError(
-                        f"The quantization method {model_config.quantization} "
-                        "is not supported for the current GPU. "
-                        f"Minimum capability: {quant_config.get_min_capability()}. "
-                        f"Current capability: {capability}."
-                    )
+                    if envs.SGLANG_ALLOW_SUB80_QUANT.get():
+                        logger.warning(
+                            "Quantization method %s declares minimum capability "
+                            "%s but the current GPU has capability %s. "
+                            "SGLANG_ALLOW_SUB80_QUANT=1 is set, so loading "
+                            "proceeds on the community-maintained sub-80 path "
+                            "(W8A16/W4A16 dequant fallbacks; accuracy and "
+                            "performance are NOT upstream-verified).",
+                            model_config.quantization,
+                            quant_config.get_min_capability(),
+                            capability,
+                        )
+                    else:
+                        raise ValueError(
+                            f"The quantization method {model_config.quantization} "
+                            "is not supported for the current GPU. "
+                            f"Minimum capability: {quant_config.get_min_capability()}. "
+                            f"Current capability: {capability}. "
+                            "Set SGLANG_ALLOW_SUB80_QUANT=1 to attempt loading "
+                            "on the community-maintained sub-80 path."
+                        )
         supported_dtypes = quant_config.get_supported_act_dtypes()
         if model_config.dtype not in supported_dtypes:
             raise ValueError(

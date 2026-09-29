@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -77,6 +78,30 @@ IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
 
 _arange_cache = {}
 
+# Bytes of gathered key/value a single KV chunk of the torch logits fallback is
+# allowed to occupy. The fallback is the only indexer path on architectures
+# without DeepGEMM or TileLang support (sub-90, where the bf16 intrinsics the
+# TileLang templates use do not exist), and on those cards the KV pool already
+# sits on nearly all of HBM, so this has to be small. 64 MiB keeps the gather and
+# the [batch, chunk, num_heads] score tile inside what a 0.97 mem-fraction
+# server has free; SGLANG_INDEXER_LOGITS_KV_CHUNK_MB raises it on roomier cards,
+# where fewer chunks means fewer kernel launches.
+_LOGITS_KV_CHUNK_BYTES = (
+    int(os.environ.get("SGLANG_INDEXER_LOGITS_KV_CHUNK_MB", "64")) * 1024 * 1024
+)
+
+
+def _torch_indexer_row_chunk(max_seq_len: int) -> int:
+    """Query rows the torch fallback may score in one call.
+
+    Its output is [rows, max_seq_len] fp32, so the row count has to shrink as
+    the context grows or the logits alone eat the headroom the KV pool left.
+    At a 262K context this returns 64 rows (64 MiB of logits) instead of the
+    full 512-row prefill chunk, which is 537 MiB.
+    """
+    rows = _LOGITS_KV_CHUNK_BYTES // max(1, max_seq_len * 4)
+    return max(1, rows)
+
 
 def fp8_paged_mqa_logits_torch(
     q_fp8: torch.Tensor,
@@ -109,25 +134,56 @@ def fp8_paged_mqa_logits_torch(
     kvcache_flat = kvcache_fp8.view(-1, total_dim)
 
     pages_clamped = page_table.clamp(min=0)
-    kvcache_gathered = kvcache_flat[pages_clamped]
-
-    kv_values_raw = kvcache_gathered[..., :SCALE_OFFSET].contiguous()
-    kv_values_fp8 = kv_values_raw.view(dtype=FP8_DTYPE)
-    kv_values = kv_values_fp8.to(torch.bfloat16)
-    kv_values = kv_values.reshape(batch_size, max_num_pages * block_size, head_dim)
-
-    kv_scales_raw = kvcache_gathered[..., SCALE_OFFSET:].contiguous()
-    kv_scales = kv_scales_raw.view(dtype=torch.float32)
-    kv_scales = kv_scales.reshape(batch_size, max_num_pages * block_size)
-
-    q_float = q_fp8[:, 0].to(torch.bfloat16)
-    scores = torch.bmm(kv_values, q_float.transpose(1, 2))
-    scores = F.relu(scores)
-    scores = scores * weight.unsqueeze(1)
-    scores = scores.sum(dim=2)
-    scores = scores * kv_scales
 
     padded_seq_len = max_num_pages * block_size
+    scores = torch.empty(
+        (batch_size, padded_seq_len), dtype=torch.float32, device=kvcache_fp8.device
+    )
+    q_float = q_fp8[:, 0].to(torch.bfloat16)
+
+    # Peak memory, not arithmetic, is what limits this fallback. Gathering a
+    # whole row at once costs batch * padded_seq_len * head_dim * 2 bytes, and
+    # the [batch, seq, num_heads] score tile it feeds is num_heads (64) times
+    # that again: at a 262K context that is tens of GB, and it already killed a
+    # 20K-token prefill. So the row is walked in page chunks with the head
+    # reduction inside each chunk. Chunking along KV is exact -- every output
+    # position depends only on its own key and scale -- unlike chunking along
+    # queries, which would not change the per-row peak at all.
+    #
+    # The budget is the live peak, so the per-position cost has to count every
+    # copy that is alive at once, not just the gather: the gathered block (132
+    # bytes), the contiguous payload slice (128), its bf16 widening (256), and
+    # the fp32 score tile before the head reduction (num_heads * 4 = 256).
+    # Sizing this on the bf16 copy alone let a "64 MiB" budget reach ~200 MB and
+    # OOM at 250K by 1 MiB.
+    chunk_pages = max(
+        1,
+        _LOGITS_KV_CHUNK_BYTES
+        // (
+            batch_size
+            * block_size
+            * (total_dim + head_dim + head_dim * 2 + num_heads * 4)
+        ),
+    )
+
+    for p0 in range(0, max_num_pages, chunk_pages):
+        p1 = min(p0 + chunk_pages, max_num_pages)
+        gathered = kvcache_flat[pages_clamped[:, p0:p1]]
+
+        kv_raw = gathered[..., :SCALE_OFFSET].contiguous()
+        kv_values = kv_raw.view(dtype=FP8_DTYPE).to(torch.bfloat16)
+        kv_values = kv_values.reshape(batch_size, (p1 - p0) * block_size, head_dim)
+
+        scale_raw = gathered[..., SCALE_OFFSET:].contiguous()
+        kv_scales = scale_raw.view(dtype=torch.float32)
+        kv_scales = kv_scales.reshape(batch_size, (p1 - p0) * block_size)
+
+        chunk_scores = torch.bmm(kv_values, q_float.transpose(1, 2))
+        chunk_scores = F.relu(chunk_scores)
+        chunk_scores = chunk_scores * weight.unsqueeze(1)
+        chunk_scores = chunk_scores.sum(dim=2)
+        scores[:, p0 * block_size : p1 * block_size] = chunk_scores * kv_scales
+
     cache = _arange_cache
     arange_key = f"arange_{padded_seq_len}_{scores.device}"
     if arange_key not in cache:
@@ -727,6 +783,27 @@ class C4IndexerBackendMixin:
         plan: NonPagedIndexerPlan,
         rows: slice,
     ) -> torch.Tensor:
+        from sglang.srt.layers import deep_gemm_wrapper
+
+        if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+            # Sub-90 (SM75/SM80): no DeepGEMM; Triton fp16 MQA logits.
+            from sglang.kernels.ops.attention.dsa.triton_mqa_logits import (
+                fp16_mqa_logits_triton,
+            )
+
+            q = q_indexer[rows]
+            k_fp8, k_scale = kv
+            out = q.new_empty((q.shape[0], plan.max_seqlen_k), dtype=torch.float32)
+            return fp16_mqa_logits_triton(
+                q,
+                k_fp8,
+                k_scale,
+                weights[rows],
+                plan.ks[rows],
+                plan.ke[rows],
+                out,
+            )
+
         import deep_gemm
 
         return deep_gemm.fp8_mqa_logits(
@@ -1077,6 +1154,22 @@ class C4IndexerBackendMixin:
                         deep_gemm_metadata[chunk_idx],
                         topk_plans[chunk_idx] if topk_plans is not None else None,
                     )
+            elif fn is fp8_paged_mqa_logits_torch and (
+                _c4sl.shape[0]
+                > _torch_indexer_row_chunk(indexer_metadata.max_compressed_seq_len)
+            ):
+                # The fallback returns [rows, max_seq_len] fp32 logits, which
+                # grows with the context independently of the KV chunking above:
+                # a 512-row prefill chunk at a 262K context is 537 MB on its own,
+                # and that is what OOMed after the gather was fixed. The fallback
+                # ignores deep_gemm_metadata, so the same metadata is valid for
+                # every chunk; other implementations precompute it per row count,
+                # which is why this branch is gated on the function identity.
+                num_rows = _c4sl.shape[0]
+                step = _torch_indexer_row_chunk(indexer_metadata.max_compressed_seq_len)
+                for start in range(0, num_rows, step):
+                    rows = slice(start, min(start + step, num_rows))
+                    run_paged_indexer(rows, deep_gemm_metadata)
             else:
                 run_paged_indexer(all_rows, deep_gemm_metadata)
 
@@ -1137,7 +1230,9 @@ class C4Indexer(nn.Module):
             self.n_heads * self.head_dim,
             bias=False,
             quant_config=quant_config,
-            params_dtype=torch.bfloat16,
+            # Omitted so it follows the model dtype. Quantized checkpoints
+            # ignore it, but an unquantized fallback would build bf16 weights
+            # on sub-90, where the model runs fp16 for lack of bf16 cores.
             prefix=add_prefix("wq_b", prefix),
         )
         expert_pack_quant_config = (
@@ -1150,7 +1245,9 @@ class C4Indexer(nn.Module):
             self.n_heads,
             bias=False,
             quant_config=expert_pack_quant_config,
-            params_dtype=torch.bfloat16,
+            # Stored bf16 in the checkpoint and unquantized, so this must track
+            # the model dtype: on sub-90 the activations are fp16 and a bf16
+            # weight fails the matmul dtype check.
             prefix=add_prefix("weights_proj", prefix),
         )
         self.compressor = Compressor(

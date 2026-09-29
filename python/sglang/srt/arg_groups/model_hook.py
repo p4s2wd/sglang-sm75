@@ -473,6 +473,42 @@ def handle_model_specific_adjustments(server_args: Any):
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
             envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
+        else:
+            major, _ = get_platform().device_capability
+            if major is not None and major < 9:
+                # SM75/SM80 (Turing/Ampere): no FP8/FP4 tensor cores, no
+                # DeepGEMM (auto-disabled below sm90), no TileLang, no CuTeDSL.
+                # Route everything through the fp16/bf16 dequant paths:
+                #  - wo_a: load-time FP8->fp16 dequant + einsum absorb GEMM
+                #  - dense FP8 linears: load-time dequant (fp8.py sub-80 branch)
+                #  - routed MXFP4 experts: Triton W4A16 grouped GEMM
+                #  - indexer logits: torch fallback (same choice as SM120)
+                # Requires SGLANG_ALLOW_SUB80_QUANT=1 to pass the loader gate.
+                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+                envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
+                envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
+                envs.SGLANG_OPT_USE_TILELANG_MHC_POST.set(False)
+                envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(False)
+                envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
+                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+                envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.set(False)
+                envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
+                envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
+                if server_args.moe_runner_backend in (None, "auto"):
+                    server_args.moe_runner_backend = "triton"
+                # The torch top-k path is the only one that can run here (see
+                # DSATopKBackend._arch_supports_sgl_kernel, which does the
+                # downgrade at resolve time -- assigning dsa_topk_backend here
+                # would not reach readers, which go through the exec bag).
+                # The torch path requires unfused top-k.
+                envs.SGLANG_DSA_FUSE_TOPK.set(False)
+                logger.warning(
+                    "DeepSeek-V4 on SM%s: using the community-maintained "
+                    "sub-90 path (fp16 dequant linears, Triton W4A16 experts, "
+                    "torch indexer logits). Accuracy and performance are NOT "
+                    "upstream-verified.",
+                    get_platform().device_sm,
+                )
 
     elif model_arch in ["GptOssForCausalLM"]:
         # Attention backend selection + XPU dtype validation moved to the

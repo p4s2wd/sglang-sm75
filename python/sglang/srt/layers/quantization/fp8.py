@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+from functools import partial
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
@@ -550,6 +551,91 @@ class Fp8LinearMethod(LinearMethodBase):
         self.use_aiter_fp8_per_token = envs.SGLANG_USE_AITER_FP8_PER_TOKEN.get()
         self.use_per_token_if_dynamic = False
 
+        # Sub-80 (SM75/SM80) fallback: no FP8 tensor cores. When the loader
+        # gate was bypassed with SGLANG_ALLOW_SUB80_QUANT=1, dequantize FP8
+        # weights to the activation dtype at load time and run plain GEMMs.
+        self.sub80_dequant = False
+        self.dequantized_to_16bit = False
+        # Preferred sub-80 path: keep the FP8 payload in HBM and dequantize in
+        # registers inside the GEMV/GEMM. Widening at load time doubles the
+        # bytes a batch-1 decode reads per token and holds the fp16 copy in
+        # HBM, which is exactly the memory a long context needs for KV.
+        self.sub80_w8a16 = False
+        if _is_cuda and envs.SGLANG_ALLOW_SUB80_QUANT.get():
+            from sglang.srt.utils import get_device_capability
+
+            major, _minor = get_device_capability()
+            self.sub80_dequant = major is not None and major < 8
+            self.sub80_w8a16 = self.sub80_dequant
+
+    def _keep_fp8_for_w8a16(self, layer: Module) -> bool:
+        """True if this layer can run through the W8A16 kernel as FP8.
+
+        The kernel needs a block scale it can index directly, so only
+        block-quantized layers qualify; per-tensor and per-channel scales go
+        through the load-time widening that already handles them. Scales stored
+        as e8m0 exponents are turned into real multipliers once, here, so the
+        kernel does no exponent math per tile.
+        """
+        if not self.sub80_w8a16 or not self.block_quant:
+            return False
+        weight = layer.weight.data
+        if not (weight.dtype.is_floating_point and weight.dtype.itemsize == 1):
+            return False
+        if weight.dim() != 2:
+            return False
+        scale = getattr(layer, "weight_scale_inv", None)
+        if scale is None:
+            return False
+        block_n, block_k = self.weight_block_size
+        n, k = weight.shape
+        # The kernel indexes scale[n // block_n, k // block_k], so the grid has
+        # to cover the weight, with the ragged tail handled by masking.
+        if scale.shape[0] < (n + block_n - 1) // block_n:
+            return False
+        if scale.shape[1] < (k + block_k - 1) // block_k:
+            return False
+        if getattr(scale, "format_ue8m0", False):
+            layer.weight_scale_inv = Parameter(
+                torch.exp2(scale.float() - 127.0), requires_grad=False
+            )
+        elif scale.dtype != torch.float32:
+            layer.weight_scale_inv = Parameter(scale.float(), requires_grad=False)
+        layer.weight = Parameter(weight.data, requires_grad=False)
+        self.w8a16_active = True
+        return True
+
+    def _dequantize_layer_to_16bit(self, layer: Module, out_dtype: torch.dtype) -> None:
+        """Dequantize an FP8 (optionally block-scaled) layer to `out_dtype`."""
+        weight = layer.weight.data
+        # Any 1-byte float is an FP8 payload we can widen. Enumerating the
+        # family by name is fragile across torch versions (e5m2 is
+        # `float8_e5m2`, not `..._fn`), and a missed name silently skips the
+        # dequant, leaving FP8 bytes in an fp16 layer.
+        if not (weight.dtype.is_floating_point and weight.dtype.itemsize == 1):
+            return
+        w = weight.float()
+        if self.block_quant and hasattr(layer, "weight_scale_inv"):
+            scale = layer.weight_scale_inv.float()
+            if getattr(layer.weight_scale_inv, "format_ue8m0", False):
+                scale = torch.exp2(scale - 127.0)
+            block_n, block_k = self.weight_block_size
+            n, k = w.shape
+            scale = scale.repeat_interleave(block_n, dim=0)[:n].repeat_interleave(
+                block_k, dim=1
+            )[:, :k]
+            w = w * scale
+        elif hasattr(layer, "weight_scale") and layer.weight_scale is not None:
+            w = w * layer.weight_scale.float().mean()
+        layer.weight = Parameter(w.to(out_dtype), requires_grad=False)
+        for attr in ("weight_scale_inv", "weight_scale", "input_scale"):
+            if hasattr(layer, attr):
+                try:
+                    layer.register_parameter(attr, None)
+                except Exception:
+                    setattr(layer, attr, None)
+        self.dequantized_to_16bit = True
+
     @staticmethod
     def validate_block_quant_shapes(
         quant_config,
@@ -1011,6 +1097,15 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.input_scale = None
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        if self.sub80_dequant:
+            # Prefer keeping the payload as FP8 and dequantizing inside the
+            # GEMV/GEMM: half the bytes per token and half the HBM. Falls back
+            # to widening here for anything the kernel cannot index.
+            if self._keep_fp8_for_w8a16(layer):
+                return
+            out_dtype = getattr(layer, "orig_dtype", None) or torch.bfloat16
+            self._dequantize_layer_to_16bit(layer, out_dtype)
+            return
         if self.block_quant:
             self.process_weights_after_loading_block_quant(layer)
         else:
@@ -1151,6 +1246,18 @@ class Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if getattr(self, "dequantized_to_16bit", False):
+            # Sub-80 fallback: weight was dequantized to fp16/bf16 at load
+            # time; run a plain GEMM (cuBLAS picks the fp16 tensor cores).
+            return F.linear(x, layer.weight, bias)
+
+        if getattr(self, "w8a16_active", False):
+            # Sub-80 preferred path: FP8 payload stays in HBM and the kernel
+            # dequantizes it in registers, on the fp16 tensor cores.
+            from sglang.kernels.ops.quantization.fp8_w8a16 import w8a16_linear
+
+            return w8a16_linear(x, layer.weight, layer.weight_scale_inv, bias)
+
         if self.use_marlin:
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,
@@ -1292,6 +1399,51 @@ class Fp8LinearMethod(LinearMethodBase):
         )
 
 
+_SLOT_INDEX_CACHE: dict = {}
+
+# Shared empty kwargs for the W4A16 GEMM call when the picked kernel takes no
+# num_tokens. A module-level constant so the non-v3 path allocates nothing per step.
+_NO_KWARGS: dict = {}
+
+# Fused SwiGLU-with-clamp for the SM75 W4A16 MoE path. Imported here rather than at
+# the top of the file because the elementwise module pulls in Triton, and this module is
+# imported by every quant config whether or not the SM75 path is in use.
+try:
+    from sglang.kernels.ops.elementwise.elementwise import (
+        moe_swiglu_clamp as _moe_swiglu_clamp,
+    )
+
+    _MOE_SWIGLU_CLAMP_OK = True
+except Exception:  # pragma: no cover - Triton missing or too old
+    _moe_swiglu_clamp = None
+    _MOE_SWIGLU_CLAMP_OK = False
+
+try:
+    from sglang.kernels.ops.elementwise.elementwise import moe_combine as _moe_combine
+
+    _MOE_COMBINE_OK = True
+except Exception:  # pragma: no cover - Triton missing or too old
+    _moe_combine = None
+    _MOE_COMBINE_OK = False
+
+
+def _slot_index(num_slots: int, device) -> torch.Tensor:
+    """Cached [0, num_slots) int32 vector.
+
+    GEMM2 gathers by padded-slot *position*, so its gather ids are just the
+    identity, and the scatter's comparison range is the same vector. It is
+    read-only and depends only on the length, so it is safe to share across
+    layers and across graph replays -- unlike the scratch buffers, which the
+    dual-stream MoE path could otherwise alias.
+    """
+    key = (num_slots, device)
+    vec = _SLOT_INDEX_CACHE.get(key)
+    if vec is None:
+        vec = torch.arange(num_slots, dtype=torch.int32, device=device)
+        _SLOT_INDEX_CACHE[key] = vec
+    return vec
+
+
 class Fp8MoEMethod(FusedMoEMethodBase):
     """MoE method for FP8.
     Supports loading FP8 checkpoints with static weight scale and
@@ -1319,6 +1471,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # The MxFP4 wrapper methods borrow this instance for weight loading;
         # they never call create_moe_runner, so moe_runner_config is unset.
         self._owns_moe_runner = False
+        # Sub-80 (SM75/SM80) routed-expert path: Triton W4A16 grouped GEMM
+        # over the MXFP4-packed weights. Only when the loader gate was bypassed
+        # and the checkpoint really carries packed-MXFP4 experts.
+        self.sub80_mxfp4_w4a16 = False
+        if _is_cuda and envs.SGLANG_ALLOW_SUB80_QUANT.get() and self.is_fp4_expert:
+            from sglang.srt.utils import get_device_capability
+
+            major, _minor = get_device_capability()
+            self.sub80_mxfp4_w4a16 = major is not None and major < 8
         if get_moe_runner_backend().is_cutlass():
             assert cutlass_fp8_supported(), (
                 "cutlass_fp8 MoE requires CUDA 12.0+ with SM90 or CUDA 12.4+ with SM89"
@@ -1657,6 +1818,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             use_mxfp8=self.use_mxfp8,
             is_checkpoint_fp8_serialized=self.quant_config.is_checkpoint_fp8_serialized,
             is_fp4_expert=self.is_fp4_expert,
+            # Sub-80 reads the UE8M0 scale straight out of the checkpoint as a
+            # raw byte, so allocate it at its native 1-byte width. The default
+            # (float32) costs 4x on 9.26e9 scale elements -- 3.2 GiB per card at
+            # TP2xPP4, which is what pushed the stage over a 22 GiB card.
+            fp4_scale_dtype=(torch.float8_e8m0fnu if self.sub80_mxfp4_w4a16 else None),
             params_dtype=params_dtype,
             with_bias=with_bias,
             **extra_weight_attrs,
@@ -2417,6 +2583,56 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_weight.is_shuffled = True
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        if self.sub80_mxfp4_w4a16:
+            # Warm the PTX W4A16 JIT here rather than on the first forward:
+            # nvcc compilation inside a CUDA graph capture would fail, and it
+            # would otherwise stall the first decode step. Memoized, so this
+            # costs a compile once per process, not once per layer.
+            from sglang.kernels.ops.moe.mxfp4_w4a16_kernels import (
+                get_ptx_direct_module,
+                get_ptx_module,
+                repack_mxfp4_inplace_,
+                w4a16_repack_supported,
+            )
+
+            if get_ptx_direct_module() is None:
+                logger.info(
+                    "PTX W4A16 kernel unavailable; the sub-90 MoE path will use "
+                    "the Triton kernel (~6.6x slower). Needs nvcc + ninja on PATH."
+                )
+
+            # The repacked-layout kernel is 1.35-1.59x the direct one. It used to
+            # be ruled out because it wanted a float32 copy of the scales (1.6 GiB
+            # per card); it now takes the same UE8M0 bytes the direct kernel
+            # reads, and the repack itself is a permutation of the same bytes done
+            # one expert at a time, so it costs nothing in steady-state memory.
+            #
+            # Done here, not in the forward: a per-forward repack would allocate
+            # and cannot be captured in a CUDA graph.
+            layer._w4a16_repacked = False
+            if (
+                envs.SGLANG_SM75_W4A16_REPACK.get()
+                and get_ptx_module() is not None
+                and (
+                    w4a16_repack_supported(layer.w13_weight.data)
+                    and w4a16_repack_supported(layer.w2_weight.data)
+                )
+            ):
+                # Both shapes checked up front: repacking one tensor and then
+                # declining the other would leave the layer half in each layout,
+                # and the kernels cannot tell the difference.
+                try:
+                    repack_mxfp4_inplace_(layer.w13_weight.data)
+                    repack_mxfp4_inplace_(layer.w2_weight.data)
+                    layer._w4a16_repacked = True
+                except Exception as e:
+                    logger.warning(
+                        "W4A16 repack failed (%s); keeping the direct-layout "
+                        "kernel. This costs ~1.4x on the expert GEMMs.",
+                        e,
+                    )
+                    layer._w4a16_repacked = False
+
         if _is_hip and _use_hip_int4:
             self.process_weights_hip_int4(layer)
 
@@ -2869,6 +3085,257 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 2,
             ).transpose(1, 2)
 
+    @staticmethod
+    def _pick_w4a16_gemm(
+        layer,
+        aligned,
+        gemm_triton,
+        gemm_repacked,
+        gemm_direct,
+        gemm_v3,
+        get_v3_module,
+        get_direct_module,
+    ):
+        """Choose the expert GEMM for this layer, once.
+
+        PTX mma.sync is ~6.6x the Triton kernel on SM75. If
+        process_weights_after_loading repacked the weights into the lane-major
+        layout, the repacked kernel applies, which is another 1.35-1.59x on top;
+        otherwise the direct kernel reads the raw checkpoint layout. Fall back to
+        Triton if no JIT module is available (no nvcc/ninja at runtime) or if a
+        TP-sharded dimension breaks the warp-tile alignment (BN=8 across N, one
+        MXFP4 scale group of 32 across K).
+
+        v3 sits on top of the repacked path: it keeps the repacked weight
+        addressing and changes only the launch shape (one warp owns several
+        consecutive n tiles, so the m16n8k8 activation fragments are loaded once
+        per k step instead of once per tile) plus a PRMT byte lookup for the
+        nibble dequant. Measured 1.73x at 6 active experts and 1.81x at 48,
+        bit-equal to the repacked kernel after normalising -0.0.
+        """
+        if getattr(layer, "_w4a16_repacked", False):
+            nt = envs.SGLANG_SM75_W4A16_V3_NT.get()
+            if nt in (2, 4) and get_v3_module() is not None:
+                cfg = 2 if nt == 2 else 3
+                # The k-split cfgs carry the same (NT, PRMT) shape with the k reduction
+                # divided across grid.z. The wrapper refuses them above 448 blocks, so
+                # asking unconditionally is safe: prefill and larger batches fall back to
+                # the unsplit launch inside the call and pay nothing.
+                if envs.SGLANG_SM75_W4A16_KSPLIT.get() == 2:
+                    cfg = 9 if nt == 2 else 7
+                # Marks the layer so the call site passes num_tokens, which the wrapper
+                # needs to drop to NT=2 for a single-token batch. Recorded here rather
+                # than probed per step because this pick is cached on the layer.
+                layer._w4a16_v3 = True
+                return partial(gemm_v3, cfg=cfg)
+            return gemm_repacked
+        if aligned and get_direct_module() is not None:
+            return gemm_direct
+        return gemm_triton
+
+    def _apply_sub80_mxfp4_w4a16(self, layer, dispatch_output):
+        """SM75/SM80 routed-expert path: MXFP4-packed weights stay packed in
+        HBM; the Triton W4A16 grouped GEMM dequantizes e2m1 nibbles in
+        registers. No FP8/FP4 tensor cores required.
+
+        The shared expert is FP8 in this checkpoint (not MXFP4-packed), so
+        shared-expert fusion must stay off on sub-80; the shared expert runs
+        through its own dequantized fp16 dense MLP.
+        """
+        from sglang.kernels.ops.moe.mxfp4_w4a16_kernels import (
+            get_ptx_direct_module,
+            get_ptx_v3_module,
+            mxfp4_w4a16_gemm,
+            mxfp4_w4a16_gemm_ptx,
+            mxfp4_w4a16_gemm_ptx_direct,
+            mxfp4_w4a16_gemm_ptx_v3,
+        )
+        from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
+            moe_align_block_size,
+        )
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        # PTX mma.sync kernel is ~6.6x the Triton kernel on SM75. If
+        # process_weights_after_loading repacked the weights into the lane-major
+        # layout, use the repacked kernel, which is another 1.35-1.59x on top;
+        # otherwise the direct kernel, which reads the raw checkpoint layout.
+        # Fall back to Triton if no JIT module is available (no nvcc/ninja at
+        # runtime) or if a TP-sharded dimension breaks the warp-tile alignment
+        # (BN=8 across N, one MXFP4 scale group of 32 across K).
+        aligned = (
+            layer.w13_weight.shape[1] % 8 == 0
+            and layer.w13_weight.shape[2] % 16 == 0
+            and layer.w2_weight.shape[1] % 8 == 0
+            and layer.w2_weight.shape[2] % 16 == 0
+        )
+        # Cached on the layer: this runs on every forward, and the choice is
+        # fixed once the weights are loaded. It also keeps the env read and the
+        # JIT module probe out of the decode step, where per-step Python is
+        # measured cost (the decode step is launch-latency sensitive).
+        gemm = getattr(layer, "_w4a16_gemm", None)
+        if gemm is None:
+            gemm = self._pick_w4a16_gemm(
+                layer,
+                aligned,
+                mxfp4_w4a16_gemm,
+                mxfp4_w4a16_gemm_ptx,
+                mxfp4_w4a16_gemm_ptx_direct,
+                mxfp4_w4a16_gemm_ptx_v3,
+                get_ptx_v3_module,
+                get_ptx_direct_module,
+            )
+            layer._w4a16_gemm = gemm
+        x = dispatch_output.hidden_states
+        topk_weights, topk_ids, _ = dispatch_output.topk_output
+        cfg = self.moe_runner_config
+        num_tokens = x.shape[0]
+        topk = topk_ids.shape[1]
+        E = layer.w13_weight.shape[0]
+        inter2 = layer.w13_weight.shape[1]  # gate | up
+        hidden = x.shape[-1]
+        block_m = 16
+
+        sorted_ids, expert_ids, num_valid = moe_align_block_size(topk_ids, block_m, E)
+        # sorted_ids/expert_ids are capacity-sized torch.empty buffers; only the
+        # first num_valid entries were written. Everything past that is garbage,
+        # so both the GEMM (via num_valid) and the scatter below are bounded by
+        # it. num_valid stays on the device: no host sync, graph-capturable.
+        num_slots = sorted_ids.shape[0]
+        # sorted ids are flattened slot indices in [0, num_tokens*topk); pad
+        # slots carry the sentinel num_tokens*topk. The kernel gathers rows of
+        # `a` by the slot id, so `a` is x repeated topk times (row j = x[j//k]).
+        max_slot = num_tokens * topk
+        a_g = x.repeat_interleave(topk, dim=0).to(torch.float16).contiguous()
+
+        # empty, not zeros: the GEMM writes every row it is told to read and the
+        # scatter below never reads a row the GEMM skipped. Zeroing these buffers
+        # cost more than the GEMM itself -- num_slots is the align buffer's
+        # *capacity* (num_tokens*topk + (E+1)*(block_m-1)), which at decode is
+        # 3861 rows against 6 live ones, so ~63 MB per layer was cleared for
+        # nothing. Cached because the shape is stable across steps, which also
+        # keeps the CUDA graph's pointers stable.
+        inter_slots = torch.empty(
+            (num_slots, inter2), dtype=torch.float16, device=x.device
+        )
+        # num_tokens is static per CUDA graph capture, so the wrapper's NT=2-for-bs1
+        # branch bakes per captured batch size and never synchronizes. Only the v3
+        # kernel takes the argument; the other picks ignore it. The dict is cached on
+        # the layer because this path is launch-latency sensitive, and it is keyed by
+        # the batch size because that is the value the wrapper branches on.
+        if getattr(layer, "_w4a16_v3", False):
+            cache = layer.__dict__.setdefault("_w4a16_ntkw", {})
+            nt_kw = cache.get(num_tokens)
+            if nt_kw is None:
+                nt_kw = cache[num_tokens] = {"num_tokens": num_tokens}
+        else:
+            nt_kw = _NO_KWARGS
+        gemm(
+            a_g,
+            layer.w13_weight,
+            layer.w13_weight_scale_inv,
+            sorted_ids,
+            expert_ids,
+            inter_slots,
+            sentinel=max_slot,
+            num_valid=num_valid,
+            **nt_kw,
+        )
+        # SwiGLU with the optional gemm1 clamp, in one kernel. The torch version is
+        # seven kernels and 20 us of device time at the decode shape (96 slots x 2048)
+        # against a ~1 us bandwidth floor; two of the seven take the non-vectorized
+        # elementwise path because chunk() hands out strided views. Fused: 2.3 us.
+        #
+        # Only a scalar limit is folded in. mxfp4 can install a per-expert limit tensor,
+        # which the kernel cannot take without another argument, so that case keeps the
+        # torch path rather than silently changing the clamp.
+        limit = cfg.gemm1_clamp_limit
+        if isinstance(limit, torch.Tensor):
+            gate, up = inter_slots.chunk(2, dim=-1)
+            act = F.silu(gate.float())
+            act = act.clamp(max=limit)
+            up = up.float().clamp(min=-limit, max=limit)
+            act = (act * up).to(torch.float16)
+        elif _MOE_SWIGLU_CLAMP_OK:
+            act = _moe_swiglu_clamp(inter_slots, limit)
+        else:
+            gate, up = inter_slots.chunk(2, dim=-1)
+            act = F.silu(gate.float())
+            if limit is not None:
+                act = act.clamp(max=limit)
+                up = up.float().clamp(min=-limit, max=limit)
+            act = (act * up).to(torch.float16)
+
+        # GEMM2 input is indexed by padded-slot POSITION, so gather ids are the
+        # identity; the expert block structure is unchanged.
+        slot_ids = _slot_index(num_slots, x.device)
+        down_slots = torch.empty(
+            (num_slots, hidden), dtype=torch.float16, device=x.device
+        )
+        gemm(
+            act,
+            layer.w2_weight,
+            layer.w2_weight_scale_inv,
+            slot_ids,
+            expert_ids,
+            down_slots,
+            sentinel=num_slots,
+            num_valid=num_valid,
+            **nt_kw,
+        )
+
+        # scatter slot -> (token, k), then combine over topk
+        #
+        # Graph-safe by construction: a boolean mask (sorted_ids[valid]) would
+        # call nonzero(), which synchronizes to the host and cannot be captured.
+        # Instead, redirect every invalid slot to a spare discard row so the
+        # copy is unconditional. Invalid means either the pad sentinel or a
+        # position past num_valid, where sorted_ids is uninitialized and would
+        # otherwise write out of range.
+        # Still zeroed: row max_slot is the discard row every invalid slot
+        # writes to and must read back as zero, and a token whose experts were
+        # all filtered out has no row written at all. It is only max_slot+1 rows
+        # (num_tokens*topk), not num_slots, so this one is cheap.
+        # Weighted sum over topk, in one kernel. The torch version zeroes a
+        # [max_slot+1, hidden] buffer, redirects invalid slots with where(), scatters
+        # with index_copy_, then casts the whole thing to fp32, multiplies and reduces:
+        # 13 kernels and 32.4 us of device time at the decode shape against 5.8 us
+        # fused. Verified bit-identical to it, including the cases where num_valid
+        # leaves some owners with no row at all.
+        #
+        # The discard row the torch version needed exists only because index_copy_ must
+        # write somewhere for every slot; the fused kernel tests the owner on a scalar
+        # and simply does not load those rows, so there is nothing to zero and no
+        # synchronizing nonzero() to avoid.
+        if _MOE_COMBINE_OK:
+            # The kernel casts once at the store, so writing straight into x.dtype
+            # reproduces the torch path's single fp32-to-dtype cast.
+            out = _moe_combine(
+                down_slots,
+                sorted_ids,
+                topk_weights,
+                num_valid,
+                num_tokens,
+                topk,
+                cfg.routed_scaling_factor,
+                out=torch.empty((num_tokens, hidden), dtype=x.dtype, device=x.device),
+            )
+        else:
+            out_ts = torch.zeros(
+                (max_slot + 1, hidden), dtype=torch.float16, device=x.device
+            )
+            slot_range = slot_ids  # same [0, num_slots) vector, read-only
+            valid = (sorted_ids < max_slot) & (slot_range < num_valid)
+            dst = torch.where(valid, sorted_ids, torch.full_like(sorted_ids, max_slot))
+            out_ts.index_copy_(0, dst.long(), down_slots)
+            out = (
+                out_ts[:max_slot].view(num_tokens, topk, hidden).float()
+                * topk_weights.float().unsqueeze(-1)
+            ).sum(dim=1)
+            if cfg.routed_scaling_factor is not None:
+                out = out * cfg.routed_scaling_factor
+            out = out.to(x.dtype)
+        return StandardCombineInput(hidden_states=out)
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -2890,6 +3357,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_weight_scale=layer.w2_weight_scale_inv,
             )
             return self.runner.run(dispatch_output, quant_info)
+        if getattr(self, "sub80_mxfp4_w4a16", False):
+            return self._apply_sub80_mxfp4_w4a16(layer, dispatch_output)
 
         if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
