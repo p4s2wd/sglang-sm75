@@ -349,6 +349,103 @@ def _apply_attn_sink(
     return (out.float() * w.unsqueeze(-1)).to(out.dtype), combined_lse
 
 
+@triton.jit
+def _attn_tail_kernel(
+    o_ptr,  # [P, B*H, D] fp16, partial attention outputs
+    l_ptr,  # [P, B*H] f32, partial log-sum-exp (-inf for empty partials)
+    sink_ptr,  # [H] f32 when HAS_SINK
+    out_ptr,  # [B*H, D] fp16
+    lse_ptr,  # [B*H] f32
+    n_part,
+    H,
+    D,
+    stride_op,
+    stride_ob,
+    stride_lp,
+    HAS_SINK: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """One launch for the whole decode attention tail.
+
+    out[b,h] = sum_p exp(lse_p - M) * o_p[b,h] / (sum_p exp(lse_p - M) + exp(sink - M))
+    lse[b,h] = M + log(sum_p exp(lse_p - M) + exp(sink - M)),  M = max(lse_p, sink)
+
+    which is the associative, commutative closed form of what
+    `_merge_partial_attn` chained N-1 times and then `_apply_attn_sink` did --
+    about 37 aten launches per layer (15 per merge, 7 for the sink, each a
+    1-2 us grid-[1] kernel on [B,H]-sized fp32), 0.7 ms of launch-latency-bound
+    device time per decode step per pipeline stage, and the same tail runs on
+    every EXTEND chunk. The flat form keeps the whole reduction in fp32 where
+    the chain rounded the merged output back to fp16 at each step.
+
+    A partial whose lse is -inf contributes nothing (the guard the torch code
+    spelled out as `where(lse > -1e20, ...)`); a head whose parts are all empty
+    and that has no sink divides by the 1e-20 floor and reports -inf, matching
+    the chain.
+    """
+    pid = tl.program_id(0)
+    b = pid // H
+    h = pid % H
+    offs_d = tl.arange(0, BLOCK_D)
+    d_mask = offs_d < D
+
+    l_base = l_ptr + b * H + h
+    M = float("-inf")
+    for p in range(n_part):
+        lp = tl.load(l_base + p * stride_lp)
+        M = tl.maximum(M, lp)
+    if HAS_SINK:
+        M = tl.maximum(M, tl.load(sink_ptr + h))
+
+    acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    total = 0.0
+    o_base = o_ptr + (b * H + h) * stride_ob + offs_d
+    for p in range(n_part):
+        lp = tl.load(l_base + p * stride_lp)
+        w = tl.where(lp > -1e20, tl.exp(lp - M), 0.0)
+        ov = tl.load(o_base + p * stride_op, mask=d_mask, other=0.0).to(tl.float32)
+        acc += w * ov
+        total += w
+    if HAS_SINK:
+        total += tl.exp(tl.load(sink_ptr + h) - M)
+    total = tl.maximum(total, 1e-20)
+
+    tl.store(out_ptr + (b * H + h) * D + offs_d,
+             (acc / total).to(out_ptr.dtype.element_ty), mask=d_mask)
+    tl.store(lse_ptr + b * H + h, M + tl.log(total))
+
+
+def _fused_attn_tail(
+    outs: list,  # each [B, 1, H, D] fp16
+    lses: list,  # each [B, 1, H] f32
+    attn_sink: Optional[torch.Tensor],  # [H] f32
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Drop-in for chained _merge_partial_attn calls followed by _apply_attn_sink."""
+    B, _, H, D = outs[0].shape
+    parts = torch.stack([o.squeeze(1).contiguous() for o in outs])
+    part_lse = torch.stack([l.squeeze(1).contiguous() for l in lses])
+    out = torch.empty(B, H, D, dtype=outs[0].dtype, device=outs[0].device)
+    lse = torch.empty(B, H, dtype=torch.float32, device=outs[0].device)
+    sink = attn_sink if attn_sink is not None else part_lse
+    _attn_tail_kernel[(B * H,)](
+        parts,
+        part_lse,
+        sink,
+        out,
+        lse,
+        parts.shape[0],
+        H,
+        D,
+        parts.stride(0),
+        parts.stride(2),
+        part_lse.stride(0),
+        HAS_SINK=attn_sink is not None,
+        BLOCK_D=triton.next_power_of_2(D),
+        num_warps=4,
+    )
+    return out.unsqueeze(1), lse.unsqueeze(1)
+
+
 def flash_mla_sparse_decode_triton(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -377,10 +474,23 @@ def flash_mla_sparse_decode_triton(
         out_extra, lse_extra = _run_sparse_attention(
             q, extra_k_cache, extra_indices, extra_topk_length, softmax_scale
         )
-        out, lse = _merge_partial_attn(out, lse, out_extra, lse_extra)
+        if attn_sink is not None and envs.SGLANG_SM75_FUSE_ATTN_TAIL.get():
+            # One Triton launch replaces the chained merge + sink, which is
+            # ~37 aten kernels per layer per step (see _attn_tail_kernel). The
+            # flat form is also more accurate: the chain re-rounds to fp16
+            # once per merge.
+            out, lse = _fused_attn_tail(
+                [out, out_extra], [lse, lse_extra], attn_sink
+            )
+        else:
+            out, lse = _merge_partial_attn(out, lse, out_extra, lse_extra)
 
     # Apply attention sink
-    if attn_sink is not None:
+    if attn_sink is not None and not (
+        extra_k_cache is not None
+        and extra_indices is not None
+        and envs.SGLANG_SM75_FUSE_ATTN_TAIL.get()
+    ):
         out, lse = _apply_attn_sink(out, lse, attn_sink)
 
     # Return format matching PyTorch fallback: (out, lse.permute(0,2,1))

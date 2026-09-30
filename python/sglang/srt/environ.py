@@ -1173,13 +1173,6 @@ class Envs:
     # so the weights dequantize to the same numbers. Set false to use the LUT
     # (A/B switch).
     SGLANG_SM75_W8A16_ALU_DECODE = EnvBool(True)
-    # Indexer MQA logits at decode shape (B <= 16) in one Triton launch
-    # instead of the paged torch chain (page gathers, bf16 widenings, head
-    # bmm, masks -- ~25 kernels per indexer layer per step; ~1 ms of eager
-    # wall per layer outside a graph). The kernel products are fp16, closer
-    # to exact than the chain's bf16. Prefill shapes (B > 16) always keep
-    # the mm-based chain. Set false for the torch chain everywhere.
-    SGLANG_SM75_FUSE_INDEXER_LOGITS = EnvBool(True)
     # One Triton pass for the hc_pre float cast + rms statistic on small
     # batches instead of the inductor chain (to_copy, two reductions and a
     # pointwise -- ~4 launches per layer per decode step, ~70 us of
@@ -1187,6 +1180,22 @@ class Envs:
     # The mix linear stays torch, so the values round identically; only the
     # sum order of mean(x^2) changes (fp32). Set false for the torch chain.
     SGLANG_SM75_FUSE_HC_PRE = EnvBool(True)
+    # Merge the decode attention partials and apply the attention sink in one
+    # Triton launch instead of the chained torch helpers. The helpers are
+    # ~37 aten kernels per layer per step -- maximum/where/exp/fill/logaddexp
+    # over [B,H]-sized fp32, each a 1-2 us grid-[1] launch -- about 0.7 ms of
+    # launch-latency-bound device time per decode step per pipeline stage, and
+    # the same tail runs on every EXTEND chunk. The flat kernel keeps the
+    # reduction in fp32 (the chain re-rounds to fp16 per merge), so it is also
+    # ~2x closer to a float64 reference. Set false for the torch chain.
+    SGLANG_SM75_FUSE_ATTN_TAIL = EnvBool(True)
+    # Indexer MQA logits at decode shape (B <= 16) in one Triton launch
+    # instead of the paged torch chain (page gathers, bf16 widenings, head
+    # bmm, masks -- ~25 kernels per indexer layer per step; ~1 ms of eager
+    # wall per layer outside a graph). The kernel products are fp16, closer
+    # to exact than the chain's bf16. Prefill shapes (B > 16) always keep
+    # the mm-based chain. Set false for the torch chain everywhere.
+    SGLANG_SM75_FUSE_INDEXER_LOGITS = EnvBool(True)
     # Comma-separated KV widths to capture a decode CUDA graph for, in addition to
     # the context length. DeepSeek-V4 fixes the indexer's logits-row width at
     # capture time, so a single graph captured at the full context length makes an
