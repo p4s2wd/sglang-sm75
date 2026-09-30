@@ -1173,6 +1173,13 @@ class Envs:
     # so the weights dequantize to the same numbers. Set false to use the LUT
     # (A/B switch).
     SGLANG_SM75_W8A16_ALU_DECODE = EnvBool(True)
+    # Indexer MQA logits at decode shape (B <= 16) in one Triton launch
+    # instead of the paged torch chain (page gathers, bf16 widenings, head
+    # bmm, masks -- ~25 kernels per indexer layer per step; ~1 ms of eager
+    # wall per layer outside a graph). The kernel products are fp16, closer
+    # to exact than the chain's bf16. Prefill shapes (B > 16) always keep
+    # the mm-based chain. Set false for the torch chain everywhere.
+    SGLANG_SM75_FUSE_INDEXER_LOGITS = EnvBool(True)
     # Comma-separated KV widths to capture a decode CUDA graph for, in addition to
     # the context length. DeepSeek-V4 fixes the indexer's logits-row width at
     # capture time, so a single graph captured at the full context length makes an

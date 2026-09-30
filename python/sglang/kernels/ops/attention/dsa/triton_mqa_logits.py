@@ -95,6 +95,11 @@ def fp16_mqa_logits_triton(
     chunk: int = _CHUNK,
 ) -> torch.Tensor:
     Q, H, D = q_fp8.shape
+    if Q <= 16:
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_SM75_FUSE_INDEXER_LOGITS.get():
+            return mqa_logits_smallq(q_fp8, k_fp8, k_scale, weights, ks, ke, out)
     N = out.shape[1]
     K = k_fp8.shape[0]
     k16 = k_fp8.to(torch.float16)
@@ -125,4 +130,220 @@ def fp16_mqa_logits_triton(
         # logits with new_empty, so leaving it undefined would hand the top-k
         # whatever the allocator last left in that block.
         out[:, n_scored:].zero_()
+    return out
+
+
+import triton
+import triton.language as tl
+
+from sglang.kernels.ops.quantization.fp8_w8a16 import _e4m3_to_f16, fp8_payload_lut
+
+
+
+
+
+
+@triton.jit
+def _mqa_logits_smallq_kernel(
+    q_ptr,  # [Q, H, D] uint8-viewed float8_e4m3fn
+    k_ptr,  # [K, D] uint8-viewed float8_e4m3fn
+    ks_ptr,  # [K] float32 per-key scales
+    w_ptr,  # [Q, H] float32
+    lo_ptr,  # [Q] int32 first scored column
+    hi_ptr,  # [Q] int32 end of scored range
+    out_ptr,  # [Q, N] float32
+    k_n,
+    n_cols,
+    stride_q0,
+    stride_qh,
+    stride_wq,
+    stride_on,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+):
+    """logits[q, t] = k_scale[t] * sum_h w[q,h] * relu(q[q,h] . k[t]) on [lo, hi).
+
+    The sub-90 stand-in for deep_gemm's fp8_paged_mqa_logits: the torch chain
+    it replaces (fp8->fp16 copies of q and k, an fp16 mm, an fp16 head bmm and
+    a masked_fill -- ~25 launches and ~1 ms of eager wall per indexer layer at
+    decode) collapses to this one launch. One q row per program: at decode
+    q_n is 1, and owning a single [D] row of q per head turns every dot into a
+    broadcasted [BLOCK_T, D] product, which keeps the whole kernel off the
+    tl.dot operand-staging path that costs more than the math on sm75.
+    Products are fp16 (the precision of the torch mm this replaces), the head
+    sum is fp32.
+    """
+    pid_t = tl.program_id(0)
+    q = tl.program_id(1)
+    offs_t = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
+    offs_d = tl.arange(0, D)
+    t_ld = tl.minimum(offs_t, k_n - 1)
+
+    kt = _e4m3_to_f16(tl.load(k_ptr + t_ld[:, None] * D + offs_d[None, :]))
+    acc = tl.zeros((BLOCK_T,), dtype=tl.float32)
+    for h in range(H):
+        qh = _e4m3_to_f16(tl.load(q_ptr + q * stride_q0 + h * stride_qh + offs_d))
+        s = tl.sum((kt * qh[None, :]).to(tl.float32), axis=1)
+        wh = tl.load(w_ptr + q * stride_wq + h)
+        acc += wh * tl.maximum(s, 0.0)
+
+    lo = tl.load(lo_ptr + q)
+    hi = tl.load(hi_ptr + q)
+    keep = (offs_t >= lo) & (offs_t < hi) & (offs_t < k_n)
+    scale = tl.load(ks_ptr + t_ld)
+    out = tl.where(keep, acc * scale, 0.0)
+    tl.store(out_ptr + q * stride_on + offs_t, out, mask=offs_t < n_cols)
+
+
+def mqa_logits_smallq(
+    q_fp8: torch.Tensor,
+    k_fp8: torch.Tensor,
+    k_scale: torch.Tensor,
+    weights: torch.Tensor,
+    ks: torch.Tensor,
+    ke: torch.Tensor,
+    out: torch.Tensor,
+    block_t: int = 32,
+) -> torch.Tensor:
+    """Decode-shape (Q <= 16) path; see _mqa_logits_smallq_kernel.
+
+    Same arguments as fp16_mqa_logits_triton.
+    """
+    Q, H, D = q_fp8.shape
+    if Q > 16:
+        raise ValueError("mqa_logits_smallq serves Q <= 16")
+    K = k_fp8.shape[0]
+    N = out.shape[1]
+    q_b = q_fp8.view(torch.uint8) if q_fp8.dtype != torch.uint8 else q_fp8
+    k_b = k_fp8.view(torch.uint8) if k_fp8.dtype != torch.uint8 else k_fp8
+    _mqa_logits_smallq_kernel[(triton.cdiv(N, block_t), Q)](
+        q_b,
+        k_b,
+        k_scale,
+        weights,
+        ks,
+        ke,
+        out,
+        K,
+        N,
+        q_fp8.stride(0),
+        q_fp8.stride(1),
+        weights.stride(0),
+        out.stride(0),
+        H=H,
+        D=D,
+        BLOCK_T=block_t,
+        num_warps=4,
+        num_stages=1,
+    )
+    return out
+
+
+@triton.jit
+def _mqa_paged_smallq_kernel(
+    q_ptr,  # [B, H, D] uint8-viewed float8_e4m3fn
+    kvc_ptr,  # [num_pages, 64 * (D + 4)] uint8 page rows: D payload + D/32 fp32... see wrapper
+    pt_ptr,  # [B, max_pages] int64 page table, -1 = hole
+    seq_ptr,  # [B] sequence lengths
+    w_ptr,  # [B, H] float32
+    out_ptr,  # [B, n_out] float32
+    max_pages,
+    n_out,
+    stride_qb,
+    stride_qh,
+    stride_pb,
+    stride_wb,
+    stride_ob,
+    PAGE: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+):
+    """Paged variant of _mqa_logits_smallq_kernel for the indexer caches.
+
+    Page rows hold [PAGE * D] payload bytes followed by PAGE fp32 per-key
+    scales, so a strip's gather is page_table-driven. Holes (page -1) and
+    columns past seq_lens store zero, matching the torch chain's clamp-then-
+    mask. One q row per program (batch axis of the grid); the same
+    dot-free formulation as the non-paged kernel.
+    """
+    pid_t = tl.program_id(0)
+    b = tl.program_id(1)
+    offs_t = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
+    offs_d = tl.arange(0, D)
+    page = offs_t // PAGE
+    row = offs_t % PAGE
+    in_t = offs_t < n_out
+    pidx = tl.minimum(page, max_pages - 1)
+    phys = tl.load(pt_ptr + b * stride_pb + pidx)
+    valid = (page < max_pages) & (phys >= 0)
+    phys_s = tl.maximum(phys, 0)
+
+    byte_base = kvc_ptr + phys_s[:, None] * (PAGE * (D + 4)) + row[:, None] * D
+    kt = _e4m3_to_f16(tl.load(byte_base + offs_d[None, :]))
+    acc = tl.zeros((BLOCK_T,), dtype=tl.float32)
+    for h in range(H):
+        qh = _e4m3_to_f16(tl.load(q_ptr + b * stride_qb + h * stride_qh + offs_d))
+        s = tl.sum((kt * qh[None, :]).to(tl.float32), axis=1)
+        wh = tl.load(w_ptr + b * stride_wb + h)
+        acc += wh * tl.maximum(s, 0.0)
+
+    scale = tl.load(
+        kvc_ptr.to(tl.pointer_type(tl.float32))
+        + phys_s * (PAGE * (D + 4)) // 4
+        + PAGE * D // 4
+        + row,
+    )
+    seq = tl.load(seq_ptr + b)
+    keep = valid & (offs_t < seq)
+    tl.store(
+        out_ptr + b * stride_ob + offs_t,
+        tl.where(keep, acc * scale, 0.0),
+        mask=in_t,
+    )
+
+
+def mqa_paged_smallq(
+    q_fp8: torch.Tensor,  # [B, 1, H, D] fp8
+    kvcache_fp8: torch.Tensor,  # [pages, PAGE, 1, D+4] uint8-viewed
+    weight: torch.Tensor,  # [B, H] f32
+    seq_lens: torch.Tensor,  # [B]
+    page_table: torch.Tensor,  # [B, max_pages] int64
+    max_seq_len: int,
+    out: torch.Tensor,  # [B, max_seq_len]
+) -> torch.Tensor:
+    """Paged decode-shape indexer logits; see _mqa_paged_smallq_kernel."""
+    bsz, _, H, D = q_fp8.shape
+    if bsz > 16:
+        raise ValueError("mqa_paged_smallq serves B <= 16")
+    page = kvcache_fp8.shape[1]
+    kvc = kvcache_fp8.view(-1, page * (D + 4))
+    kvc_b = kvc if kvc.dtype == torch.uint8 else kvc.view(torch.uint8)
+    q_b = (
+        q_fp8[:, 0].view(torch.uint8)
+        if q_fp8.dtype != torch.uint8
+        else q_fp8[:, 0]
+    )
+    _mqa_paged_smallq_kernel[(triton.cdiv(max_seq_len, 32), bsz)](
+        q_b,
+        kvc_b,
+        page_table,
+        seq_lens,
+        weight,
+        out,
+        page_table.shape[1],
+        max_seq_len,
+        q_fp8.stride(0),
+        q_fp8.stride(2),
+        page_table.stride(0),
+        weight.stride(0),
+        out.stride(0),
+        PAGE=page,
+        H=H,
+        D=D,
+        BLOCK_T=32,
+        num_warps=4,
+        num_stages=1,
+    )
     return out

@@ -132,6 +132,22 @@ def fp8_paged_mqa_logits_torch(
     SCALE_OFFSET = block_size * head_dim
     total_dim = block_size * (head_dim + 4)
 
+    # One Triton launch for the decode shape (deepseek_v4 runs the indexer on
+    # every 4th layer, and the torch chain below is ~25 kernels -- page
+    # gathers, bf16 widenings, bmm, relu, head sum, masks -- per layer per
+    # step). The kernel also products in fp16 where the chain uses bf16.
+    if envs.SGLANG_SM75_FUSE_INDEXER_LOGITS.get() and batch_size <= 16:
+        from sglang.kernels.ops.attention.dsa.triton_mqa_logits import (
+            mqa_paged_smallq,
+        )
+
+        scores = torch.empty(
+            (batch_size, max_seq_len), dtype=torch.float32, device=kvcache_fp8.device
+        )
+        return mqa_paged_smallq(
+            q_fp8, kvcache_fp8, weight, seq_lens, page_table, max_seq_len, scores
+        )
+
     kvcache_flat = kvcache_fp8.view(-1, total_dim)
 
     pages_clamped = page_table.clamp(min=0)
