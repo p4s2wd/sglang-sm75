@@ -1165,6 +1165,15 @@ class Envs:
     # [T, hc_mult, hc_mult, hidden] fp32 twice, which at hidden=4096 and a 512-token
     # prefill chunk is ~1 GB of traffic for 4 MB of output. 0 disables it.
     SGLANG_SM75_FUSED_HC_POST = EnvInt(1)
+    # Keep the LM head as block-scaled e4m3 instead of bf16 and run it through
+    # the W8A16 GEMV. The checkpoint ships head.weight bf16, so at vocab 129280
+    # and TP2 every decode step on the last PP stage streams 530 MB of weight
+    # for one row (measured 0.908 ms, a cuBLAS gemv, already at the card's read
+    # ceiling -- the only way past it is fewer bytes). fp8 halves the read; the
+    # GEMV measures 0.666 ms for the shard shape against 0.908 for the bf16
+    # gemv. Quantized per 128x128 block at load, same recipe as every dense
+    # layer. Set false to keep the bf16 head (A/B switch).
+    SGLANG_SM75_LMHEAD_FP8 = EnvBool(True)
     # Decode the e4m3 weight bytes with integer ops instead of the 256-entry
     # payload LUT load. The gather costs up to 32 distinct L1 sectors per warp
     # instruction, and that L1 traffic serializes against the weight stream:
@@ -1173,13 +1182,6 @@ class Envs:
     # so the weights dequantize to the same numbers. Set false to use the LUT
     # (A/B switch).
     SGLANG_SM75_W8A16_ALU_DECODE = EnvBool(True)
-    # One Triton pass for the hc_pre float cast + rms statistic on small
-    # batches instead of the inductor chain (to_copy, two reductions and a
-    # pointwise -- ~4 launches per layer per decode step, ~70 us of
-    # launch-latency-bound device time per stage per step at 6-11 layers).
-    # The mix linear stays torch, so the values round identically; only the
-    # sum order of mean(x^2) changes (fp32). Set false for the torch chain.
-    SGLANG_SM75_FUSE_HC_PRE = EnvBool(True)
     # Merge the decode attention partials and apply the attention sink in one
     # Triton launch instead of the chained torch helpers. The helpers are
     # ~37 aten kernels per layer per step -- maximum/where/exp/fill/logaddexp
@@ -1189,6 +1191,13 @@ class Envs:
     # reduction in fp32 (the chain re-rounds to fp16 per merge), so it is also
     # ~2x closer to a float64 reference. Set false for the torch chain.
     SGLANG_SM75_FUSE_ATTN_TAIL = EnvBool(True)
+    # One Triton pass for the hc_pre float cast + rms statistic on small
+    # batches instead of the inductor chain (to_copy, two reductions and a
+    # pointwise -- ~4 launches per layer per decode step, ~70 us of
+    # launch-latency-bound device time per stage per step at 6-11 layers).
+    # The mix linear stays torch, so the values round identically; only the
+    # sum order of mean(x^2) changes (fp32). Set false for the torch chain.
+    SGLANG_SM75_FUSE_HC_PRE = EnvBool(True)
     # Indexer MQA logits at decode shape (B <= 16) in one Triton launch
     # instead of the paged torch chain (page gathers, bf16 widenings, head
     # bmm, masks -- ~25 kernels per indexer layer per step; ~1 ms of eager

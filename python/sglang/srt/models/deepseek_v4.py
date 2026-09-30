@@ -5275,6 +5275,9 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         if is_nextn:
             return
+
+        if envs.SGLANG_SM75_LMHEAD_FP8.get() and self.pp_group.is_last_rank:
+            self._quantize_lm_head_fp8()
         for layer_id in range(self.model.start_layer, self.model.end_layer):
             layer = self.model.layers[layer_id]
             self_attn = layer.self_attn
@@ -5289,6 +5292,49 @@ class DeepseekV4ForCausalLM(nn.Module):
             ):
                 self_attn.indexer.compressor.apply_ape_hotfix()
             layer.refresh_mhc_norm_weight_cache()
+
+    def _quantize_lm_head_fp8(self) -> None:
+        """Store the LM head as block-scaled e4m3 and free the bf16 copy.
+
+        The checkpoint ships head.weight bf16, so each decode step on the last
+        PP stage streams 530 MB of weight per row at TP2, which a cuBLAS gemv
+        already runs at the card's read ceiling. Halving the bytes is the only
+        way faster. Quantization is the same 128x128-block recipe the dense
+        layers use, done on CPU so the GPU never needs the fp32 scratch.
+        """
+        lm_head = self.lm_head
+        weight = getattr(lm_head, "weight", None)
+        if weight is None or getattr(lm_head, "weight_fp8", None) is not None:
+            return
+        n, k = weight.shape
+        if n % 128 or k % 128:
+            logger.warning(
+                "lm_head shard %s is not a multiple of the 128 block scale; "
+                "keeping the bf16 head",
+                (n, k),
+            )
+            return
+        blocks = weight.detach().float().cpu().view(n // 128, 128, k // 128, 128)
+        amax = blocks.abs().amax(dim=(1, 3), keepdim=True).clamp_(min=1e-4)
+        scale = amax / 448.0
+        wq = ((blocks / scale).to(torch.float8_e4m3fn)).view(n, k)
+        lm_head.register_buffer(
+            "weight_fp8", wq.to(weight.device), persistent=False
+        )
+        lm_head.register_buffer(
+            "weight_scale_inv",
+            scale.view(n // 128, k // 128).to(device=weight.device),
+            persistent=False,
+        )
+        del lm_head.weight
+        logger.info(
+            "lm_head quantized to fp8 (shard %dx%d): decode reads %d MB/tok "
+            "instead of %d MB/tok",
+            n,
+            k,
+            n * k // 2**20,
+            2 * n * k // 2**20,
+        )
 
     def precompile_kernels_after_loading(self) -> None:
         from sglang.srt.layers.moe.mega_moe import (
@@ -5854,13 +5900,24 @@ class DeepseekV4ForCausalLM(nn.Module):
             self._prewarm_mhc_kernels()
 
     def get_embed_and_head(self):
+        if not hasattr(self.lm_head, "weight"):
+            raise RuntimeError(
+                "lm_head is stored as fp8 (SGLANG_SM75_LMHEAD_FP8); embedding/"
+                "head sharing needs SGLANG_SM75_LMHEAD_FP8=0"
+            )
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
-        del self.lm_head.weight
+        if getattr(self.lm_head, "weight_fp8", None) is not None:
+            del self.lm_head.weight_fp8
+            del self.lm_head.weight_scale_inv
+        else:
+            del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
+        if envs.SGLANG_SM75_LMHEAD_FP8.get() and self.pp_group.is_last_rank:
+            self._quantize_lm_head_fp8()
         # Hot weight reload (RL workflows). Use the device-agnostic module
         # accessor so this works on both CUDA/HIP and NPU.
         torch.get_device_module().empty_cache()

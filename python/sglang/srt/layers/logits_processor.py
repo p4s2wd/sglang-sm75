@@ -958,6 +958,16 @@ class LogitsProcessor(nn.Module):
         lm_head: VocabParallelEmbedding,
         embedding_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        weight_fp8 = getattr(lm_head, "weight_fp8", None)
+        if weight_fp8 is not None:
+            from sglang.kernels.ops.quantization.fp8_w8a16 import w8a16_linear
+
+            return w8a16_linear(
+                hidden_states,
+                weight_fp8,
+                lm_head.weight_scale_inv,
+                embedding_bias,
+            )
         quant_method = getattr(lm_head, "quant_method", None)
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method
