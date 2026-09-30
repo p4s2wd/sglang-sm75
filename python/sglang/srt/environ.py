@@ -1180,6 +1180,13 @@ class Envs:
     # to exact than the chain's bf16. Prefill shapes (B > 16) always keep
     # the mm-based chain. Set false for the torch chain everywhere.
     SGLANG_SM75_FUSE_INDEXER_LOGITS = EnvBool(True)
+    # One Triton pass for the hc_pre float cast + rms statistic on small
+    # batches instead of the inductor chain (to_copy, two reductions and a
+    # pointwise -- ~4 launches per layer per decode step, ~70 us of
+    # launch-latency-bound device time per stage per step at 6-11 layers).
+    # The mix linear stays torch, so the values round identically; only the
+    # sum order of mean(x^2) changes (fp32). Set false for the torch chain.
+    SGLANG_SM75_FUSE_HC_PRE = EnvBool(True)
     # Comma-separated KV widths to capture a decode CUDA graph for, in addition to
     # the context length. DeepSeek-V4 fixes the indexer's logits-row width at
     # capture time, so a single graph captured at the full context length makes an

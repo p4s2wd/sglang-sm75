@@ -2825,3 +2825,50 @@ def hc_combine(
         BLOCK_H=block_h,
     )
     return y
+
+
+@triton.jit
+def _hc_prenorm_smallm_kernel(
+    x_ptr,  # [M, HK] bf16, the flattened multi-stream residual
+    xf_ptr,  # [M, HK] f32, the float copy the rest of hc_pre consumes
+    rs_ptr,  # [M] f32, rsqrt(mean(x^2) + eps)
+    hk,
+    eps,
+    BLOCK: tl.constexpr,
+):
+    """x_flat = x.float() and the rms statistic in one launch.
+
+    The compiled torch chain spreads this over four kernels -- a to_copy, a
+    reduce for mean(x^2), a second reduce and a pointwise add/rsqrt -- each a
+    few microseconds and a launch, per layer per decode step. One pass over
+    114 KB per row fits a single program comfortably.
+    """
+    pid = tl.program_id(0)
+    acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    for k0 in range(0, hk, BLOCK):
+        offs = k0 + tl.arange(0, BLOCK)
+        mask = offs < hk
+        xv = tl.load(x_ptr + pid * hk + offs, mask=mask, other=0.0).to(tl.float32)
+        # (x may already be f32; the cast is a no-op then)
+        tl.store(xf_ptr + pid * hk + offs, xv, mask=mask)
+        acc += xv * xv
+    tl.store(rs_ptr + pid, tl.rsqrt(tl.sum(acc, axis=0) / hk + eps))
+
+
+def hc_prenorm_smallm(x_flat_row: torch.Tensor, rms_norm_eps: float):
+    """Row-contiguous x [M, hc*K] (bf16/f16/f32) -> (x_flat f32, rsqrt [M])."""
+    m, hk = x_flat_row.shape
+    if x_flat_row.stride(1) != 1 or x_flat_row.stride(0) != hk:
+        x_flat_row = x_flat_row.contiguous()
+    x_flat = torch.empty((m, hk), dtype=torch.float32, device=x_flat_row.device)
+    rsqrt = torch.empty((m,), dtype=torch.float32, device=x_flat_row.device)
+    _hc_prenorm_smallm_kernel[(m,)](
+        x_flat_row,
+        x_flat,
+        rsqrt,
+        hk,
+        rms_norm_eps,
+        BLOCK=1024,
+        num_warps=8,
+    )
+    return x_flat, rsqrt

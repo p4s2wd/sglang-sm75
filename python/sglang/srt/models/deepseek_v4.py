@@ -2944,7 +2944,18 @@ class DeepseekV4DecoderLayer(nn.Module):
             rsqrt = torch.rsqrt(s_out / k + self.rms_norm_eps)
             mixes = (d_out * rsqrt.unsqueeze(1)).unsqueeze(1)
         else:
-            x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
+            if envs.SGLANG_SM75_FUSE_HC_PRE.get() and x.is_cuda and x.shape[0] <= 16:
+                # One Triton pass for the float cast + rms statistic instead of
+                # the compiled 4-kernel chain; the linear stays torch so the
+                # mix values round exactly as before.
+                from sglang.kernels.ops.layernorm.mhc import hc_prenorm_smallm
+
+                x_flat, rsqrt = hc_prenorm_smallm(
+                    x.reshape(x.shape[0], -1), self.rms_norm_eps
+                )
+                mixes = (F.linear(x_flat, hc_fn) * rsqrt.unsqueeze(1)).unsqueeze(1)
+            else:
+                x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
 
         pre, post, comb = _get_mhc_ops().hc_split_sinkhorn(
             mixes,
