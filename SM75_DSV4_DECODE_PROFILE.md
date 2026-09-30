@@ -93,6 +93,24 @@ concentrated in one fixable kernel.
 - **HS kernel knobs.** `SGLANG_SM75_HS_{NCOL,WARPS,STAGES,TRANS}` swept
   interleaved at the prefill shape: the shipped NCOL=64 / W4 / S2 / transposed
   is the optimum, no >10% win anywhere.
+- **The interconnect.** Topology is four NVLink pairs, (0,1) (2,3) (4,5) (6,7);
+  `TP2 x PP4` puts the TP all-reduce inside a pair and only the PP handoff on
+  PCIe. Measured D2D with the link under load:
+
+  | pair | path | P2P | 256 MB | 8 KB latency |
+  |------|------|-----|---------|--------------|
+  | 0<->1 | NVLink pair (where TP2 lands) | yes | **87.3 GB/s** | 46 us |
+  | 0<->2 | PIX, same PCIe switch | no | 10.3 GB/s | 50 us |
+  | 0<->4 | PHB, across host bridge (PP path) | no | 10.25 GB/s | 48 us |
+  | 0<->6 | PHB, across host bridge (PP path) | no | 10.27 GB/s | 50 us |
+
+  So the high-volume path never touches PCIe, and the PCIe path carries almost
+  nothing: 8 KB per stage per token at decode (0.15 ms/token, 0.4% of 38.3 ms)
+  and 4 MB per boundary per 512-token prefill chunk (1.2 ms of a 57 ms chunk,
+  ~2%). GeForce cards have no P2P across PCIe, so cross-pair traffic is
+  host-staged, but at these volumes it does not matter, and no PP placement
+  escapes the 10.3 GB/s ceiling (PIX and PHB measure the same). Rejected as a
+  bottleneck on measurement, not on estimate.
 
 ## Concurrency is the remaining headroom
 
@@ -130,6 +148,12 @@ Small, in order of effort:
    does not need a device-side `num_valid` -- would let the wider grids that
    measured 337 GB/s at 1536 blocks and 388 at 6144 actually apply. Then sweep
    the cfgs already present in `W4A16_V3_CFGS` / `_KS_CFG`.
+4. **All-reduce kernel efficiency, prefill only** (~6% of a chunk, and the only
+   interconnect-adjacent item left). The TP all-reduce runs on NVLink at
+   87 GB/s, but an EXTEND event of 4 MB takes 0.216 ms, i.e. 18.5 GB/s -- a
+   fifth of the link. Getting each event to link speed would save ~3.7 ms per
+   512-token chunk. This is the kernel, not the wire, so it is invisible in any
+   bandwidth check of the interconnect.
 
 ## Pitfalls that cost real time
 
@@ -142,6 +166,10 @@ Small, in order of effort:
   payload with rope zeroed at the right offset must give a constant output.
 - **e4m3 NaN byte.** Payload byte 127 (and 255) are NaN in the lookup table.
   Bench payloads must be `randint(0, 127)`, not `randint(0, 256)`.
+- **`nvidia-smi` PCIe generation at idle.** `pcie.link.gen.current` reports 1 on
+  all eight cards while nothing is running (ASPM downclock); the link trains to
+  Gen3 under load, which is what the 10.3 GB/s D2D numbers above are. Judge the
+  link by a copy benchmark, not by the idle reading.
 - **Profiling then loading.** A server that has run `/start_profile` should be
   restarted before it serves real load; twice in one session we lost a run to a
   crash that a restart fixed.
