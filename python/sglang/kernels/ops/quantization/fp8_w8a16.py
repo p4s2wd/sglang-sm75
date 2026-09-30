@@ -76,6 +76,33 @@ def fp8_payload_lut(device: torch.device, out_dtype: torch.dtype) -> torch.Tenso
 
 
 @triton.jit
+def _e4m3_to_f16(b):
+    """Exact e4m3fn byte -> fp16, built with integer ops instead of a table.
+
+    The LUT the kernels used to hold this table costs more than the decode it
+    saves: one gather instruction hits up to 32 different L1 sectors per warp,
+    and that L1 traffic serializes against the weight stream. Measured on a
+    4096x4096 tile with everything else in place, removing only the LUT lifts
+    the GEMV from 283 to 450 GB/s.
+
+    For a normal e4m3 the fp16 bits are the exponent field shifted for the
+    bias change (7 -> 15, so +8) with the mantissa seven bits up:
+    `(em << 7) + (8 << 10)`, one shift and one add, and the addition cannot
+    carry into the mantissa because 8 fits in the exponent field alone
+    (e4m3fn is finite, its largest exponent 15 plus 8 stays below fp16
+    inf). Subnormals (em < 8) are m * 2^-9, a three-bit integer times a
+    power of two, exact in either float format.
+    """
+    u = b.to(tl.int32) & 0xFF
+    em = u & 0x7F
+    bits = (em << 7) + (8 << 10)
+    v = bits.to(tl.int16).to(tl.float16, bitcast=True)
+    sub = (u & 0x7).to(tl.float32) * 0.001953125
+    v = tl.where(em < 8, sub.to(tl.float16), v)
+    return tl.where(u < 0x80, v, -v)
+
+
+@triton.jit
 def _w8a16_gemv_kernel(
     x_ptr,
     w_ptr,
@@ -95,6 +122,7 @@ def _w8a16_gemv_kernel(
     group_size: tl.constexpr,
     rows: tl.constexpr,
     even_k: tl.constexpr,
+    alu: tl.constexpr,
 ):
     """out [rows, N] = x [rows, K] @ W^T, with W stored [N, K] so k is contiguous.
 
@@ -134,7 +162,10 @@ def _w8a16_gemv_kernel(
         else:
             k_mask = k_start + offs_k < k
             w_byte = tl.load(w_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0)
-        w_deq = tl.load(lut_ptr + w_byte) * scale.to(lut_ptr.dtype.element_ty)
+        if alu:
+            w_deq = _e4m3_to_f16(w_byte) * scale.to(tl.float16)
+        else:
+            w_deq = tl.load(lut_ptr + w_byte) * scale.to(lut_ptr.dtype.element_ty)
 
         if even_k:
             xv = tl.load(x_ptr + k_start + offs_k)
@@ -247,6 +278,7 @@ def _w8a16_gemv_wide_kernel(
     block_k: tl.constexpr,
     group_size: tl.constexpr,
     rows: tl.constexpr,
+    alu: tl.constexpr,
 ):
     """Same GEMV, reading block_k (a multiple of group_size) bytes per row per step.
 
@@ -298,12 +330,16 @@ def _w8a16_gemv_wide_kernel(
 
     for k_start in range(0, k, block_k):
         w_byte = tl.load(w_ptrs, mask=n_mask[:, None], other=0)
-        scale = tl.load(s_ptrs).to(lut_ptr.dtype.element_ty)
+        if alu:
+            scale = tl.load(s_ptrs).to(tl.float16)
+            w3 = tl.reshape(_e4m3_to_f16(w_byte), (block_n, n_groups, group_size))
+        else:
+            scale = tl.load(s_ptrs).to(lut_ptr.dtype.element_ty)
+            w3 = tl.reshape(tl.load(lut_ptr + w_byte), (block_n, n_groups, group_size))
         # Reshape the dequantized tile to (block_n, n_groups, group_size) first, so the
         # per-group scale broadcasts along the middle axis only. Multiplying it against
         # the flat (block_n, block_k) tile would line the scales up with the wrong
         # columns and nothing would complain.
-        w3 = tl.reshape(tl.load(lut_ptr + w_byte), (block_n, n_groups, group_size))
         w_deq = (w3 * scale[None, :, None]).to(tl.float32)
         xv = tl.load(x_ptr + k_start + offs_k).to(tl.float32)
         acc0 += tl.reshape(
@@ -467,6 +503,7 @@ def _w8a16_linear_impl(
 
     even_k = k % BLOCK_SCALE == 0
     lut = fp8_payload_lut(x.device, x.dtype)
+    alu_deq = envs.SGLANG_SM75_W8A16_ALU_DECODE.get()
     out = torch.empty((m, n), dtype=x.dtype, device=x.device)
 
     if m <= _GEMV_MAX_ROWS:
@@ -534,6 +571,7 @@ def _w8a16_linear_impl(
                     block_k=block_k,
                     group_size=BLOCK_SCALE,
                     rows=m,
+                    alu=alu_deq,
                     num_warps=4,
                     num_stages=4,
                 )
@@ -557,6 +595,11 @@ def _w8a16_linear_impl(
             group_size=BLOCK_SCALE,
             rows=m,
             even_k=even_k,
+            # The narrow kernel's block_n=64 tiles at the deep-grid shapes are
+            # issue-bound, and the decode's integer ops lose to the gather
+            # there (0.80x at q_b, 0.59x at the LM head shard). The wide
+            # kernel's latency-bound tiles have the issue slots free.
+            alu=False,
             num_warps=num_warps,
             num_stages=4,
         )

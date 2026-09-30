@@ -1165,6 +1165,14 @@ class Envs:
     # [T, hc_mult, hc_mult, hidden] fp32 twice, which at hidden=4096 and a 512-token
     # prefill chunk is ~1 GB of traffic for 4 MB of output. 0 disables it.
     SGLANG_SM75_FUSED_HC_POST = EnvInt(1)
+    # Decode the e4m3 weight bytes with integer ops instead of the 256-entry
+    # payload LUT load. The gather costs up to 32 distinct L1 sectors per warp
+    # instruction, and that L1 traffic serializes against the weight stream:
+    # on a 4096x4096 GEMV, removing only the LUT measured 283 -> 450 GB/s.
+    # The decode is exact on every non-NaN byte (the checkpoint has no NaNs),
+    # so the weights dequantize to the same numbers. Set false to use the LUT
+    # (A/B switch).
+    SGLANG_SM75_W8A16_ALU_DECODE = EnvBool(True)
     # Comma-separated KV widths to capture a decode CUDA graph for, in addition to
     # the context length. DeepSeek-V4 fixes the indexer's logits-row width at
     # capture time, so a single graph captured at the full context length makes an
