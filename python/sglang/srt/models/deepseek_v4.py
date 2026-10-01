@@ -2391,9 +2391,21 @@ class MQALayer(MqaAttentionBase):
             attn_q = q_padded if q_padded is not None else q
             save_kv_cache = False
             if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
-                o = attn_q.new_empty(
-                    (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
+                # The head axis here must be n_local_heads, not attn_q's. When
+                # q_padded is in play attn_q carries kernel_num_heads (64 on
+                # SM75/TP2, since _kernel_num_heads only narrows on sm120) while
+                # attn_backend.forward returns TP-local heads (32). Sizing `o`
+                # off attn_q then makes numel exactly tp_size times ret's and
+                # trips the assert in deepseek_v4_attention_with_output at
+                # capture time (16777216 != 8388608 at num_tokens=512).
+                # The eager `unified` branch above avoids this by passing q_out,
+                # the local slice, instead of the padded buffer.
+                o_shape = (
+                    (*attn_q.shape[:-2], self.n_local_heads, self.attn_mqa.v_head_dim)
+                    if attn_q.dim() == 3
+                    else (*attn_q.shape[:-1], self.attn_mqa.v_head_dim)
                 )
+                o = attn_q.new_empty(o_shape)
                 bcg_deepseek_v4_attention_with_output(
                     attn_q,
                     attn_k,
