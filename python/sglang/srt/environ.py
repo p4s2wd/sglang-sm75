@@ -486,6 +486,14 @@ class Envs:
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
     SGLANG_VALIDATE_MAMBA_REPLAY_STATE_INDICES = EnvBool(False)
+    # Sparse-decode page indices must stay inside [0, num_pages * page_size). The
+    # Triton kernels that consume them only mask `raw >= 0` and are never handed
+    # num_pages, so a single stale entry sends the gather past the end of the KV
+    # cache and the device raises an illegal memory access. Checking on the host
+    # names the offender instead of letting the fault surface at whatever launch
+    # happens to come next. DIAGNOSTIC: costs a device sync per call, and clamps
+    # (rather than faults) so the run can finish and be observed.
+    SGLANG_VALIDATE_SPARSE_INDICES = EnvBool(False)
     SGLANG_GDN_DECODE_FUSION_LOG_LAYER_HITS = EnvBool(False)
     SGLANG_GDN_DECODE_FUSION_VERIFY_REAL_TENSORS = EnvBool(False)
     # NaN-fill the unified memory pool at boot (debug repro switch).
@@ -1254,6 +1262,12 @@ class Envs:
     SGLANG_CRASH_ON_TRITON_LOAD_AFTER_READY = EnvBool(False)
     SGLANG_TRITON_SLOW_COMPILE_THRESHOLD_SECS = EnvFloat(1.0)
     SGLANG_TRITON_LOAD_WARNING_THRESHOLD_GB = EnvFloat(1.0)
+    # DIAGNOSTIC ONLY: synchronize the device after every Triton launch so an
+    # async CUDA fault (e.g. illegal memory access) is reported at the launch
+    # that caused it instead of at some later eager launch. CUDA_LAUNCH_BLOCKING
+    # does not cover Triton, which goes through cuLaunchKernel. Serializes the
+    # device, so never leave this on when collecting throughput numbers.
+    SGLANG_TRITON_SYNC_EVERY_LAUNCH = EnvBool(False)
     # gfx950 MLA decode stage-1: pick the launch geometry and split count per batch.
     # Reorders the fp32 accumulation, so off by default.
     SGLANG_MLA_DECODE_TUNE = EnvBool(False)

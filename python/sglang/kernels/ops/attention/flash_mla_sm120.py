@@ -417,6 +417,48 @@ def flashinfer_dsv4_decode_supports_num_heads(num_heads: int, num_tokens: int) -
     return num_tokens <= decode_max_tokens and num_heads in supported_heads
 
 
+def _validate_sparse_indices(k_cache, indices, label: str) -> torch.Tensor:
+    """Clamp sparse page indices into the cache, logging any that were outside.
+
+    DIAGNOSTIC, gated on ``SGLANG_VALIDATE_SPARSE_INDICES``.
+
+    Both sparse-decode kernels turn ``indices`` into an address as
+    ``raw // page_size * page_bytes + raw % page_size * TOKEN_BYTES`` and mask it
+    only with ``raw >= 0``. Neither is ever handed ``num_pages`` -- the host
+    computes it and drops it -- so the upper end is unchecked: one stale entry
+    reads off the end of the KV cache and the device raises an illegal memory
+    access, which then surfaces at whatever launch comes next rather than at the
+    one that faulted. Checking here names the offender instead.
+
+    Returns a clamped *copy* when anything was out of range, so the caller's
+    tensor (page-table metadata reused by other layers) is never mutated.
+    """
+    if indices is None or indices.numel() == 0 or k_cache is None:
+        return indices
+    if k_cache.dim() < 2:
+        return indices
+    # The `.any()` below forces a device sync, and syncing while a CUDA graph is
+    # being captured invalidates the capture (cudaErrorStreamCaptureUnsupported),
+    # which kills startup outright. Capture passes are synthetic warmup anyway.
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        return indices
+    ntok = int(k_cache.shape[0]) * int(k_cache.shape[1])
+    over = indices >= ntok
+    if not bool(over.any()):
+        return indices
+    bad = indices[over]
+    logger.error(
+        "SPARSE_INDICES_OOB [%s]: %d of %d entries outside "
+        "[0, num_pages*page_size=%d), max=%d -- clamping so the device stays alive.",
+        label,
+        int(bad.numel()),
+        int(indices.numel()),
+        ntok,
+        int(bad.max()),
+    )
+    return indices.masked_fill(over, ntok - 1)
+
+
 def flash_mla_with_kvcache_sm120(**kwargs):
     """SM120 FlashMLA sparse decode entry point.
 
@@ -434,6 +476,13 @@ def flash_mla_with_kvcache_sm120(**kwargs):
     extra_k_cache = kwargs.get("extra_k_cache")
     extra_indices = kwargs.get("extra_indices_in_kvcache")
     extra_topk_length = kwargs.get("extra_topk_length")
+
+    if envs.SGLANG_VALIDATE_SPARSE_INDICES.get():
+        indices = _validate_sparse_indices(k_cache, indices, "primary")
+        if extra_indices is not None:
+            extra_indices = _validate_sparse_indices(
+                extra_k_cache, extra_indices, "extra"
+            )
 
     if _default_backend() == "flashinfer":
         if q.shape[0] > SM120_DECODE_MAX_TOKENS:

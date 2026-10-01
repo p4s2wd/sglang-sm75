@@ -60,6 +60,74 @@ def install() -> None:
     _installed = True
 
 
+_launch_sync_installed = False
+
+
+def install_launch_sync() -> None:
+    """Sync the device after every Triton launch, pinning async faults in place.
+
+    DIAGNOSTIC ONLY; a no-op unless ``SGLANG_TRITON_SYNC_EVERY_LAUNCH=1``.
+
+    ``CUDA_LAUNCH_BLOCKING`` only covers the CUDA Runtime API, and Triton
+    launches through the driver API (``cuLaunchKernel``), so an illegal memory
+    access is reported at whatever eager launch happens to come next — which is
+    why four crash archives each produced a different, innocent frame. A
+    device-wide synchronize immediately after each launch makes the error
+    surface there instead, at worst one launch late. Cost: the device is fully
+    serialized, so this must never stay on while measuring throughput.
+    """
+    global _launch_sync_installed
+    if _launch_sync_installed:
+        return
+    if not envs.SGLANG_TRITON_SYNC_EVERY_LAUNCH.get():
+        return
+    try:
+        from triton.backends.nvidia.driver import CudaLauncher
+    except Exception:
+        logger.debug("Unable to patch Triton's CudaLauncher", exc_info=True)
+        return
+
+    original_call = CudaLauncher.__call__
+
+    def call_and_sync(self, *args, **kwargs):
+        result = original_call(self, *args, **kwargs)
+        _sync_after_launch()
+        return result
+
+    CudaLauncher.__call__ = call_and_sync
+    _launch_sync_installed = True
+    logger.warning(
+        "Syncing the device after every Triton launch "
+        "(SGLANG_TRITON_SYNC_EVERY_LAUNCH=1); throughput from this run is unusable."
+    )
+
+
+def _sync_after_launch() -> None:
+    # cudaDeviceSynchronize is rejected while a graph capture is in flight;
+    # this hook normally installs after engine-init capture, but stay safe.
+    try:
+        if torch.cuda.is_current_stream_capturing():
+            return
+        torch.cuda.synchronize()
+    except RuntimeError as e:
+        # Propagate the fault we are hunting for; swallow incidental errors
+        # (e.g. capture-phase rejections) so the diagnostic cannot mask itself.
+        if any(
+            t in str(e)
+            for t in (
+                "illegal memory access",
+                "unspecified launch failure",
+                "invalid device function",
+                "misaligned address",
+                "assertion",
+            )
+        ):
+            raise
+        logger.debug("sync after Triton launch failed: %s", e)
+    except Exception:
+        logger.debug("sync after Triton launch failed", exc_info=True)
+
+
 def mark_serving_started() -> None:
     """Arm diagnostics for subsequent Triton compilations and device-loads."""
     global _serving_started
