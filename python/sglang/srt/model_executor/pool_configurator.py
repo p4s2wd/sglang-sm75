@@ -1251,7 +1251,19 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         c4_indexer_state_bytes = 2 * 2 * self.indexer_head_dim * c4_state_dtype_size
 
         c4_state_ratio = self.ring_sizes.get(4, 0) / self.page_size
-        return self._get_paged_kv_bytes_per_token() * self.num_layers_total + (
+        # Only layers whose compress ratio is 0 are sliding-window layers; the
+        # others are sparse-attention layers that own no SWA pool at all.
+        # Charging every local layer for SWA bytes made PP0 pay 835.50 of its
+        # 1944.75 bytes/token to a pool it never allocates: in the
+        # DeepSeek-V4-Flash split the SWA layers are 0 and 1, both of which land
+        # on PP1, so PP0/PP2/PP3 have an empty swa pool. That overcount is what
+        # capped the pool at 162,304 tokens, i.e. below the 262,144 this model
+        # is configured for. The c4 state term is left alone: it is priced per
+        # c4 layer and every stage owns c4 layers.
+        swa_layers = sum(1 for r in self.stage_compress_ratios if r == 0)
+        if swa_layers == 0:
+            return 0.0
+        return self._get_paged_kv_bytes_per_token() * swa_layers + (
             c4_state_ratio
             * (c4_state_bytes + c4_indexer_state_bytes)
             * self.num_layers(4)
@@ -1513,6 +1525,41 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             )
 
         sizes = self._compute_dsv4_sizes(full_token, page_size)
+        if envs.SGLANG_DEBUG_MEMORY_POOL.get():
+            # DIAGNOSTIC: bytes_per_full_token is a single opaque number in the
+            # log line below, and it is the binding constraint on context
+            # length -- at 1944.75 B/token a 22 GiB card only reaches ~162K
+            # tokens. Print the per-component split so a change can be aimed at
+            # the dominant term instead of guessed at.
+            _swa = (
+                0 if (self._unified or self.swa_cap_tokens is not None)
+                else self.swa_ratio * self.bytes_per_swa_token
+            )
+            _per_layer = {
+                r: self._compressed_bytes_per_full_token(r) * len(ls)
+                for r, ls in self.stage_owner_layers.items()
+            }
+            logger.info(
+                "DSV4 bytes/token breakdown: "
+                f"total={self.bytes_per_full_token:.2f} "
+                f"swa={_swa:.2f} "
+                + " ".join(f"c{r}={v:.2f}(x{len(self.stage_owner_layers[r])})"
+                           for r, v in sorted(_per_layer.items()))
+                + f" | per-layer: "
+                + " ".join(f"c{r}={self._compressed_bytes_per_full_token(r):.2f}"
+                           for r in sorted(self.stage_owner_layers))
+                + f" | paged_kv: "
+                + " ".join(
+                    f"r{r}={self._get_paged_kv_bytes_per_token(r):.1f}"
+                    f"/ps{self.page_size // r if r else self.page_size}"
+                    for r in sorted(self.stage_owner_layers))
+                + f" | indexer={self.indexer_bytes_per_token:.0f} "
+                f"kv_bytes={self.kv_bytes:.0f} "
+                f"swa_ratio={self.swa_ratio} "
+                f"swa_cap={self.swa_cap_tokens} "
+                f"local_layers={self.num_layers_total} "
+                f"ratios={sorted(self.stage_compress_ratios)}"
+            )
         logger.info(
             f"DSV4 memory calculation: unified={self._unified}, "
             f"unified_fp8={self._unified_fp8}, "

@@ -38,7 +38,12 @@ import math
 
 import torch
 
-_CHUNK = 1024
+# Tile width for the [Q*H, C] score tile in fp16_mqa_logits_triton. At 1024
+# the tile is 64 MiB for a 512-token prefill chunk, and that allocation is what
+# OOMs PP0 when prefilling a 256K context -- the stage has under 0.5 GB free
+# and came up ~57 MiB short. The mm reads the same values at any tile width, so
+# this is purely a memory/speed knob with no numerical effect.
+_CHUNK = 256
 
 # Comfortably below fp16 max (65504). The scales are exact powers of two, so
 # this only has to cover the slack left by the log2 rounding in _pow2_floor.
@@ -102,7 +107,6 @@ def fp16_mqa_logits_triton(
             return mqa_logits_smallq(q_fp8, k_fp8, k_scale, weights, ks, ke, out)
     N = out.shape[1]
     K = k_fp8.shape[0]
-    k16 = k_fp8.to(torch.float16)
     q16 = q_fp8.reshape(Q, H, D).to(torch.float16)
 
     q_scale, w_scale, inv = _plan_scales(q_fp8.dtype, D, H, weights)
@@ -118,7 +122,16 @@ def fp16_mqa_logits_triton(
     n_scored = min(N, K)
     for c0 in range(0, n_scored, chunk):
         c1 = min(c0 + chunk, n_scored)
-        s = torch.mm(q16, k16[c0:c1].t())  # [Q*H, C] fp16, tensor cores
+        # Convert per chunk rather than promoting the whole gathered key set
+        # once. k_fp8 is [K, D] and K grows with the context, so the up-front
+        # fp16 copy is O(K*D) of extra device memory -- at a 260K context it
+        # competes with the KV pool for the same card and this call is what
+        # OOMs on PP0. The loop already walked the keys in chunks for the mm,
+        # so promoting inside the loop costs one extra pass over each chunk and
+        # drops the peak from O(K*D) to O(chunk*D). Elementwise, so the values
+        # fed to torch.mm are bit-identical to the whole-tensor version.
+        k16 = k_fp8[c0:c1].to(torch.float16)
+        s = torch.mm(q16, k16.t())  # [Q*H, C] fp16, tensor cores
         s.relu_()
         acc = torch.bmm(w16, s.view(Q, H, c1 - c0)).float()  # [Q, 1, C]
         acc = acc.squeeze(1) * inv * k_scale[c0:c1].unsqueeze(0)
