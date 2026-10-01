@@ -1,18 +1,91 @@
-# RELEASE NOTES — sm75 on current main (`sm75main1`)
+# RELEASE NOTES — sm75 on current main (`sm75main2`)
 
 Base: upstream `main` @ `98fce73d5b`. Wheel:
-`sglang-0.5.21.dev797+ge0f76063c.sm75main1-py3-none-any.whl`. Verified on
-2026-09-30 on the 8x RTX 2080 Ti box (SM75, 22 GiB, 150 W), TP2 x PP4,
+`sglang-0.5.21.dev797+g331faaeaf7.sm75main2-py3-none-any.whl`. Verified on
+2026-10-01 on the 8x RTX 2080 Ti box (SM75, 22 GiB, 150 W), TP2 x PP4,
 `--context-length 262144`, `--chunked-prefill-size 512`, decode CUDA graphs on
-bs 1 and 2, KV pool 270K tokens, `kv-cache-dtype fp8_e4m3`.
+bs 1 and 2, KV pool 162K tokens, `kv-cache-dtype fp8_e4m3`.
 
-## What this release is
+## Read this first: sm75main1 crashes on the stock configuration
 
-The sub-90 work, rebased. Nothing about the kernels changed: the 51 commits from
+`sm75main1` and everything before it fault with an illegal memory access within
+the first few greedy prompts, on the default DeepSeek-V4-Flash path. This is a
+correctness bug, not a tuning regression, and it is why `sm75main2` exists.
+Upgrade rather than deploying `sm75main1` anywhere new.
+
+`dsv4/topk.py`'s paged top-k transform took `page_table_width` as a parameter
+and never used it. `valid` only says `raw < seq_len`, which does not imply
+`raw // PAGE_SIZE < width`, so a stale token produced a page id past the end of
+the row (observed: 12673630). The sparse-attention gather downstream masks only
+`raw >= 0` and is never handed `num_pages`, so that garbage id was used as a KV
+address. Binding the load and the store to `page_ids < page_table_width`, and
+writing -1 otherwise, takes the observed out-of-range entries from 4 to 0.
+
+Attribution note, because it cost most of the debugging time: an async CUDA
+error surfaces at whichever eager launch runs next, and this one produced four
+unrelated frames across four archives. `CUDA_LAUNCH_BLOCKING` does not help --
+Triton goes through `cuLaunchKernel`, so blocking only moves the report. The
+trustworthy stack came from synchronizing the device after every Triton launch,
+which bounds the report to "one launch late". That switch
+(`SGLANG_TRITON_SYNC_EVERY_LAUNCH`) ships here, off by default, together with
+`SGLANG_VALIDATE_SPARSE_INDICES` which names the offending index on the host.
+
+## What else changed since sm75main1
+
+Ten commits. The first seven are decode-side work done on 2026-09-30 evening,
+after the `sm75main1` wheel was cut, so they were never released; the last
+three are the correctness fix and its diagnostics.
+
+| commit | what |
+|---|---|
+| `6b10af24c6` | decode e4m3 weights with integer ops instead of the payload LUT |
+| `ea338fce88` | decode-shape indexer MQA logits in one Triton launch |
+| `6e93a681aa` | fuse the small-batch `hc_pre` cast and RMS statistic |
+| `a93bd25001` | merge the decode attention partials and sink in one launch |
+| `ede0224de1` | store the LM head as block-scaled fp8 and run the GEMV |
+| `98d1ce1df1` | docs: the DSV4 decode accounting and its dead ends |
+| `d096e83b16` | docs: measure the interconnect, rule it out as the bottleneck |
+| `d9e9824a1e` | **fix**: bound the page id in the paged top-k transform |
+| `f308351f2a` | fix: size the breakable-graph attention output by local heads |
+| `331faaeaf7` | feat: sparse-index validation and launch-sync diagnostics |
+
+`sm75-main2-series.patch` has all ten; `sm75-optimizations.patch` has the whole
+change as one diff against `98fce73d5b`.
+
+## Launcher default: `SGLANG_PP_LAYER_PARTITION=11,11,11,10`
+
+The launcher now defaults to the F3 layer split, worth **+7.6% prefill**. sglang
+otherwise hands the remainder of 43 layers over pp=4 to the later stages, giving
+`10,11,11,11`, which leaves the last stage as the prefill bottleneck (measured
+274.6 ms/chunk against PP0's 215.2, because it also carries lm_head and
+sampling). Measured on this box: 8/8 cells positive, 1.041-1.100, decode
+unchanged with a bs=1 control of 0.999, greedy output byte-identical to the
+default split, and 200 GSM8K questions at parallel 8 with zero crashes.
+
+**The cost is VRAM on PP0**, which goes from 10 layers to 11 and drops from
+0.93 GB to 0.64 GB of headroom -- the tightest rank in the fleet. Anything that
+adds VRAM to PP0 (wider graph buckets, larger context, higher
+`--mem-fraction-static`) will hit this first.
+
+Revert with `SGLANG_PP_LAYER_PARTITION= ./launch-dsv4-sm75.sh`. Note the
+declaration deliberately uses `${VAR-default}` and not `${VAR:-default}`: with
+`:-` an explicit empty value counts as unset and the default comes back, so the
+revert would silently do nothing.
+
+Three other settings in the launcher must stay as they are, all measured:
+`PREFILL_GRAPH=disabled` (a captured prefill graph runs prefill at 0.368x on
+this configuration, and the `full` backend is not implemented for the dsv4
+attention backend at all), `SGLANG_PP_EARLY_PROXY_SEND=0` (-30% on multi-request
+decode), `SPEC_ALGO=` empty (EAGLE's draft weights are 5.34 GiB per card at
+TP2, and the checkpoint's weights are already 93.7% of the 8x22 GiB capacity, so
+it does not fit).
+
+## The sm75main1 notes below are kept for provenance
+
+Everything under this line describes the original rebase onto current main.
+Nothing about the kernels changed in that step: the 51 commits from
 `sm75-dsv4-flash` and the opt4 patch are both in, with the conflicts resolved
-against current main and three upstream-driven adaptations. See
-`sm75-main-series.patch` for the three commits and `sm75-optimizations.patch`
-for the whole thing as one diff against `98fce73d5b`.
+against current main and three upstream-driven adaptations.
 
 | commit | what |
 |---|---|

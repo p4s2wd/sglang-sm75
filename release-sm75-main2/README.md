@@ -5,9 +5,9 @@ layer, rebased onto current `main` (`98fce73d5b`) and verified on the 8x 2080 Ti
 box. Same behaviour as the opt3+opt4 build it replaces, on a base that is 1235
 commits newer.
 
-- wheel: `sglang-0.5.21.dev797+ge0f76063c.sm75main1-py3-none-any.whl`
+- wheel: `sglang-0.5.21.dev797+g331faaeaf7.sm75main2-py3-none-any.whl`
 - the whole change as one patch against upstream main: `sm75-optimizations.patch`
-- the three commits as patches: `sm75-main-series.patch`
+- the ten commits since sm75main1 as patches: `sm75-main2-series.patch`
 - launcher: `launch-dsv4-sm75.sh` (identical to `/data/nvme/sglang/deepseek-v4-flash.sh`)
 - environment: `prod-constraints.txt` (a copy of the opt4 one with
   `sglang-kernel` bumped to 0.4.7, which current main requires)
@@ -17,7 +17,31 @@ commits newer.
 
 中文说明：本目录是 SM75 优化版在**当前 main 基线**上的重新移植版（内容与之前的
 opt3+opt4 一致，基线更新了 1235 个 commit），已在 8x 2080 Ti 上做过 A/B 验证。
-详见 `RELEASE_NOTES.md`。
+**`sm75main2` 相对 `sm75main1` 修掉了一个必现的 illegal memory access**
+（`dsv4/topk.py` 缺页表宽度上界，默认配置下几个 prompt 内必崩），详见
+`RELEASE_NOTES.md`。
+
+## ⚠ sm75main1 crashes on the stock configuration
+
+If you are on `sm75main1` or anything older, upgrade rather than deploying it
+anywhere new. The paged top-k transform in `dsv4/topk.py` took
+`page_table_width` and never used it, so a stale token produced a page id past
+the end of the row (observed: 12673630), and the sparse-attention gather used
+that as a KV address -- the device faults within the first few greedy prompts.
+See "Read this first" in `RELEASE_NOTES.md` for the mechanism and the
+attribution story.
+
+## ⚠ The launcher defaults to a VRAM-tight layer split
+
+`SGLANG_PP_LAYER_PARTITION=11,11,11,10` is worth **+7.6% prefill** and is the
+default. It puts 11 layers on PP0, which drops PP0's headroom from 0.93 GB to
+0.64 GB -- the tightest rank in the fleet, and the first thing that breaks if you
+widen graph buckets, raise the context, or push `--mem-fraction-static` higher.
+
+Revert with `SGLANG_PP_LAYER_PARTITION= ./launch-dsv4-sm75.sh`. The declaration
+deliberately uses `${VAR-default}` rather than `${VAR:-default}`: with `:-` an
+explicitly empty value counts as unset and the default comes straight back, so
+the revert would silently do nothing.
 
 ## What it is
 
@@ -72,7 +96,7 @@ See `INSTALL.md`. Short version, into a Python 3.12 venv that already runs this
 model on sm75:
 
 ```bash
-pip install --no-deps --force-reinstall sglang-0.5.21.dev797+ge0f76063c.sm75main1-py3-none-any.whl
+pip install --no-deps --force-reinstall sglang-0.5.21.dev797+g331faaeaf7.sm75main2-py3-none-any.whl
 pip install "sglang-kernel==0.4.7"        # current main requires >= 0.4.7
 ```
 

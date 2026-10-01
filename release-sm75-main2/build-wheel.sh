@@ -28,7 +28,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHECKOUT="${CHECKOUT:?set CHECKOUT to the sglang checkout to build}"
 PYTHON="${PYTHON:-python3}"
-VERSION="${VERSION:-0.5.21.dev797+ge0f76063c.sm75main1}"
+VERSION="${VERSION:-0.5.21.dev797+g331faaeaf7.sm75main2}"
 OUT_DIR="${OUT_DIR:-$HERE}"
 
 command -v cargo >/dev/null 2>&1 && echo "note: cargo present but SGLANG_BUILD_RUST_EXTS=none disables the Rust build"

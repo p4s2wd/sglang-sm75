@@ -27,7 +27,7 @@ to start.
 ```bash
 VENV=/data/nvme/sglang/.venv
 "$VENV/bin/pip" install --no-deps --force-reinstall \
-    sglang-0.5.21.dev797+ge0f76063c.sm75main1-py3-none-any.whl
+    sglang-0.5.21.dev797+g331faaeaf7.sm75main2-py3-none-any.whl
 "$VENV/bin/pip" install "sglang-kernel==0.4.7"
 ```
 
@@ -89,6 +89,6 @@ file finder drops 56 package-data entries (dotfiles, the agent docs), and it
 normalises the zip timestamps afterwards because `wheel` 0.48 ignores
 `SOURCE_DATE_EPOCH`. Verified: two runs produce the same sha256, and the wheel
 is byte-identical to the tree that was benchmarked. To rebuild from the patches instead
-of a checkout, apply `sm75-main-series.patch` (or
+of a checkout, apply `sm75-main2-series.patch` (or
 `sm75-optimizations.patch`) to upstream `main` at `98fce73d5b` first; both
 apply cleanly to that commit.

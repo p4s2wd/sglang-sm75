@@ -74,6 +74,60 @@ MAXREQ="${MAXREQ:-8}"
 GRAPH_MAX_BS="${GRAPH_MAX_BS:-2}"
 GRAPH_BS="${GRAPH_BS:-1 2}"
 
+# Prefill CUDA graph. Production default is `disabled` and stays that way.
+# `breakable` is the PP opt-in backend (cuda_graph_hook auto-disables it for
+# pp_size>1 unless asked). Two reasons to try it, both from PROGRESS.md #4:
+# EXTEND is CPU-launch-bound (slow ranks run 28-49% GPU busy) so a captured
+# forward removes the launch cost, and capture happens at engine init -- which
+# is the only way the prefill Triton kernels stop device-loading mid-serving
+# (the load that precedes every IMA crash we have archived).
+# The MLA reservation for a prefill graph is a flat 1536 MB (memory_hook.py),
+# which is why this is expected to fail on a box with 0.74 GB free + 0.28 GB
+# KV pool. Measured, not assumed -- see plan2026-09-30/NOTES.md.
+PREFILL_GRAPH="${PREFILL_GRAPH:-disabled}"
+PREFILL_GRAPH_MAX_BS="${PREFILL_GRAPH_MAX_BS:-512}"
+
+# PP layer split. sglang's own default for 43 layers over pp=4 hands the
+# remainder to the later stages -> "10,11,11,11", which leaves the LAST stage
+# (PP3) as the prefill bottleneck: measured 274.6 ms/chunk vs PP0's 215.2,
+# because PP3 also carries lm_head + sampling. "11,11,11,10" moves the cheap
+# stage to PP3 and is worth +7.6% prefill (8/8 cells positive, 1.041-1.100;
+# decode unchanged, bs=1 control 0.999). Gates all passed: greedy output
+# byte-identical to the default split (6/6), 200-question GSM8K at parallel 8
+# with zero crashes, accuracy 0.940.
+#
+# COST: PP0 goes from 10 to 11 layers, so PP0's headroom drops 0.93 -> 0.64 GB,
+# the tightest rank in the fleet. Anything that adds VRAM to PP0 (wider graph
+# buckets, larger context, higher --mem-fraction-static) hits this first.
+#
+# To revert: SGLANG_PP_LAYER_PARTITION= ./deepseek-v4-flash.sh
+# (":-" would treat an explicit empty value as unset and re-apply the
+# default, so use "-": set-but-empty means "let sglang choose".)
+# See plan2026-09-30/NOTES.md section 6.9.
+SGLANG_PP_LAYER_PARTITION="${SGLANG_PP_LAYER_PARTITION-11,11,11,10}"
+# DIAGNOSTIC ONLY. Every arm that has ever hit the IMA had decode CUDA graph
+# on, and the reported stack frame drifts with config (headshared in one,
+# w8a16 dequant in another) because replay has no Python frame -- the fault
+# surfaces on the first eager launch afterwards. Setting this to `disabled`
+# forces eager decode so the true faulting kernel (or a clean bill of health)
+# can be observed. Production value is `full`; do NOT measure throughput here.
+GRAPH_BACKEND_DECODE="${GRAPH_BACKEND_DECODE:-full}"
+# PG2 measured a single 512-token bucket at 0.72 GB on PP3 (only 0.92 GB free),
+# and the capture context-shaped attention metadata / indexer logits at the
+# *model* context length (262144) unless --cuda-graph-prefill-max-context caps
+# it. PG3 therefore caps both: one bucket (replay pads up, and every chunk is
+# <=512) and a 64k context. Contexts longer than this fall back to eager, so
+# do NOT run the 128k/256k long-context arms with these set.
+PREFILL_GRAPH_BS="${PREFILL_GRAPH_BS:-}"
+PREFILL_GRAPH_MAX_CONTEXT="${PREFILL_GRAPH_MAX_CONTEXT:-}"
+
+# Speculative decoding. Empty SPEC_ALGO = off (the default), and the args are
+# only appended when it is set, so the default command line is byte-identical
+# to before. EAGLE under PP also needs SGLANG_ENABLE_PP_SPEC=1 in the env.
+SPEC_ALGO="${SPEC_ALGO:-}"
+SPEC_STEPS="${SPEC_STEPS:-2}"
+SPEC_EAGLE_TOPK="${SPEC_EAGLE_TOPK:-1}"
+
 # JIT compilation of the hand-written PTX W4A16 expert kernels needs nvcc.
 # On this box only cuda-12.9 actually ships nvcc (cuda-12.6 is a symlink to
 # 12.8 with no nvcc), and the wrong nvcc fails with
@@ -250,15 +304,36 @@ build_args() {
     --max-total-tokens "$MAX_TOTAL_TOKENS"
     --max-running-requests "$MAXREQ"
     --sleep-on-idle
-    --cuda-graph-backend-decode full
+    --cuda-graph-backend-decode "$GRAPH_BACKEND_DECODE"
     --cuda-graph-max-bs-decode "$GRAPH_MAX_BS"
     --cuda-graph-bs-decode $GRAPH_BS
-    --cuda-graph-backend-prefill disabled
+    --cuda-graph-backend-prefill "$PREFILL_GRAPH"
     --reasoning-parser deepseek-v4
     --tool-call-parser deepseekv4
     --default-chat-template-kwargs '{"thinking": true}'
     --host "$HOST" --port "$PORT"
   )
+  # Only meaningful when a prefill backend is on; passing it alongside
+  # `disabled` would silently widen the bucket list that never gets captured.
+  if [ "$PREFILL_GRAPH" != "disabled" ]; then
+    ARGS+=(--cuda-graph-max-bs-prefill "$PREFILL_GRAPH_MAX_BS")
+    # Intentionally unquoted: space-separated bucket list -> multiple argv.
+    if [ -n "$PREFILL_GRAPH_BS" ]; then
+      # shellcheck disable=SC2206
+      ARGS+=(--cuda-graph-bs-prefill $PREFILL_GRAPH_BS)
+    fi
+    if [ -n "$PREFILL_GRAPH_MAX_CONTEXT" ]; then
+      ARGS+=(--cuda-graph-prefill-max-context "$PREFILL_GRAPH_MAX_CONTEXT")
+    fi
+  fi
+  # Speculative decoding is opt-in: with SPEC_ALGO unset the server runs
+  # exactly as before. The draft lives on the last PP stage, so it only fits
+  # when that stage has headroom -- see SGLANG_PP_LAYER_PARTITION.
+  if [ -n "$SPEC_ALGO" ]; then
+    ARGS+=(--speculative-algorithm "$SPEC_ALGO")
+    ARGS+=(--speculative-num-steps "$SPEC_STEPS")
+    ARGS+=(--speculative-eagle-topk "$SPEC_EAGLE_TOPK")
+  fi
 }
 
 main() {

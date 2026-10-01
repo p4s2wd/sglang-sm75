@@ -1,69 +1,187 @@
-From caeb58825befb7c3beff0cffd18a2a2c9e8cf011 Mon Sep 17 00:00:00 2001
-From: Steven Huang <shuang@myai001.mylab.io>
-Date: Tue, 29 Sep 2026 23:48:43 +0800
-Subject: [PATCH 1/3] perf(sm75): rebase the DeepSeek-V4-Flash sub-90 work onto
- current main
-
-Squash of the 51 commits on sm75-dsv4-flash (originally on 0.5.19.dev332),
-replayed on top of main. Same scope as before:
-
-- MXFP4 W4A16 grouped GEMM (Triton + hand-written PTX mma.sync, direct /
-  repacked / v3-NT layouts with an optional k split) and the Triton fp16 MQA
-  logits kernel, plus the fp16 dequant paths for dense FP8 linears, wo_a and
-  the compressor wkv_gate.
-- Fused Triton kernels for MoE SwiGLU+clamp, the topk combine, the topk-split
-  merge and mhc_post at hc_mult==4.
-- Sparse attention: head-shared topk kernel with a split topk loop, the
-  transposed KV gather, batch-chunked torch gather, and the sub-90 backend
-  routing (DSA top-k / MoE align / sparse-MLA fallbacks that cannot load here).
-- DeepSeek-V4 decode CUDA graphs bucketed by KV length
-  (SGLANG_DSV4_DECODE_SEQ_LEN_BUCKETS), with the indexer logits row sized at
-  capture time.
-- Gating: SGLANG_ALLOW_SUB80_QUANT bypasses the loader capability gate, and
-  model_hook turns off the FP8 wo_a GEMM, DeepGEMM HC prenorm, TileLang,
-  topk_v2, JIT indexer metadata and multi-stream overlap below sm90.
-
-Adapted to upstream changes since the branch point: ShapeKey's dsa_variant is
-now attention_variant (seq_len_bucket rides alongside it), the indexer gathers
-nonpaged K separately and takes row slices, wo_a follows the model dtype when
-unquantized, and the sparse prefill / FlashMLA entry points are keyed off
-_use_torch_sparse_mla() instead of an sm120-only check.
----
- .../kernels/jit/csrc/deepseek_v4/rope.cuh     |   13 +-
- .../kernels/jit/csrc/moe/mxfp4_w4a16_ptx.cuh  |  195 +++
- .../jit/csrc/moe/mxfp4_w4a16_ptx_direct.cuh   |  182 +++
- .../jit/csrc/moe/mxfp4_w4a16_ptx_v3.cuh       |  395 ++++++
- .../ops/attention/dsa/triton_mqa_logits.py    |  136 ++
- .../kernels/ops/attention/dsv4/elementwise.py |   17 +-
- .../kernels/ops/attention/flash_mla_sm120.py  |  130 +-
- .../ops/attention/flash_mla_sm120_triton.py   | 1119 ++++++++++++++++-
- .../kernels/ops/elementwise/elementwise.py    |  187 +++
- python/sglang/kernels/ops/gemm/bf16_fp32.py   |   10 +-
- python/sglang/kernels/ops/layernorm/mhc.py    |   91 ++
- .../kernels/ops/moe/mxfp4_w4a16_kernels.py    |  680 ++++++++++
- .../kernels/ops/quantization/fp8_w8a16.py     |  731 +++++++++++
- .../speculative/dspark/dspark_draft_model.py  |   18 +-
- python/sglang/srt/arg_groups/model_hook.py    |   36 +
- python/sglang/srt/environ.py                  |   80 ++
- .../layers/attention/deepseek_v4_backend.py   |  121 +-
- .../layers/attention/dsa/dsa_topk_backend.py  |   35 +-
- .../srt/layers/attention/dsv4/compressor.py   |   17 +-
- .../srt/layers/attention/dsv4/indexer.py      |  131 +-
- .../triton_utils/moe_align_block_size.py      |   33 +
- python/sglang/srt/layers/quantization/fp8.py  |  469 +++++++
- .../runner/decode_cuda_graph_runner.py        |  112 +-
- .../srt/model_executor/runner/shape_key.py    |   25 +-
- .../runner_utils/capture_mode.py              |   21 +
- python/sglang/srt/model_loader/loader.py      |   27 +-
- python/sglang/srt/models/deepseek_v4.py       |   65 +-
- 27 files changed, 4976 insertions(+), 100 deletions(-)
- create mode 100644 python/sglang/kernels/jit/csrc/moe/mxfp4_w4a16_ptx.cuh
- create mode 100644 python/sglang/kernels/jit/csrc/moe/mxfp4_w4a16_ptx_direct.cuh
- create mode 100644 python/sglang/kernels/jit/csrc/moe/mxfp4_w4a16_ptx_v3.cuh
- create mode 100644 python/sglang/kernels/ops/attention/dsa/triton_mqa_logits.py
- create mode 100644 python/sglang/kernels/ops/moe/mxfp4_w4a16_kernels.py
- create mode 100644 python/sglang/kernels/ops/quantization/fp8_w8a16.py
-
+diff --git a/SM75_DSV4_DECODE_PROFILE.md b/SM75_DSV4_DECODE_PROFILE.md
+new file mode 100644
+index 0000000000..f85f7a410b
+--- /dev/null
++++ b/SM75_DSV4_DECODE_PROFILE.md
+@@ -0,0 +1,178 @@
++# DeepSeek-V4-Flash on SM75: decode accounting, roofline, and dead ends
++
++Notes from tuning an 8x RTX 2080 Ti (SM75, 22 GiB, 150 W) node running
++DeepSeek-V4-Flash with `TP2 x PP4`, KV in fp8_e4m3, 43 layers, 256 routed
++experts with top-6, `index_topk=512`, MLA head_dim 512 (448 nope + 64 rope).
++Measured state: **26.1 tok/s at batch 1**, 132 tok/s at batch 8, single-request
++prefill 8.9k tok/s (6k prompt in 0.68 s TTFT), GSM8K 200q 95.0%.
++
++Everything below is from kineto traces of the running engine plus in-situ
++`perf_counter` instrumentation. Numbers that came from a profiler are called
++out as such; two of them turned out to be artifacts (see Pitfalls).
++
++## Where a decode token goes
++
++38.3 ms/token at batch 1. The PP4 chain is serial at this batch size, so the
++token time is the sum of the four stages' GPU work, not a pipeline throughput:
++
++| stage | GPU busy / step | of which NCCL wait (profiler-induced) |
++|-------|-----------------|--------------------------------------|
++| PP0   | 6.8 ms          | ~0                                   |
++| PP1   | 12.4 ms         | 2.7 ms                               |
++| PP2   | 15.1 ms         | 4.2 ms                               |
++| PP3   | 12.9 ms         | 3.8 ms                               |
++
++Subtracting the waits lands at ~36.5 ms of real kernel time, which closes the
++budget against the 38.3 ms/token the engine reports without a profiler. **Decode
++is GPU-work bound.** The 2-4 ms NCCL waits are skew absorption: only the rank
++that arrives first spins, and the pair totals the same.
++
++Per-stage kernel census (TP0/PP3, per decode step, 670 kernels, 12.94 ms):
++
++| kernel family | ms/step | nodes | share of HBM peak |
++|---------------|---------|-------|-------------------|
++| `w4a16_v3` (MoE experts) | 1.50 | 22 | ~46% (289 GB/s) |
++| `w8a16_gemv` narrow | 1.27 | 29 | (dense pair below) |
++| `w8a16_gemv` wide | 1.09 | 33 | |
++| dense gemv pair | 2.36 | 62 | ~508 GB/s = **85%** |
++| `headshared_sparse` (MLA) | 0.96 | 22 | tuned out |
++| `all_reduce_1shot_push` | 0.76 | 22 | comm |
++| `wo_a_absorb` | 0.70 | 11 | **546 GB/s = 92%** |
++| unnamed Triton (`std::enable_if`) | 0.53 | 34 | mixed, see tail |
++| indexer `mqa_paged_smallq` | 0.31 | 6 | fused this series |
++| `elementwise` | 0.22 | 94 | 2 us each |
++| `cublasDot` + `reduce_1Block` | 0.22 | 44 | in hc_pre, see tail |
++| everything else | ~3.0 | ~350 | |
++
++## Why there is little left
++
++Weights resident per rank: 17.25 GiB of MXFP4-packed experts (138 GB of the
++156 GB checkpoint, TP-sharded) + 1.19 GiB of fp8/bf16 dense. A batch-1 token
++touches top-6/256 experts, so the per-rank read is ~1.63 GB, which at the
++card's 594 GB/s spec is 2.9 ms; serialised over four stages that is an 11.6 ms
++floor (86 tok/s). The engine runs at 38.3 ms, i.e. each stage reaches ~30% of
++read bandwidth -- but the families that dominate (`w8a16_gemv` 85%, `wo_a_absorb`
++92%) are already near the roof, so the shortfall is spread thin rather than
++concentrated in one fixable kernel.
++
++## Dead ends, with the evidence
++
++- **PP communication knobs.** `SGLANG_PP_COMM_OVERLAP=1` (dedicated comm
++  stream), `SGLANG_PP_EARLY_PROXY_SEND=1`, `SGLANG_ENABLE_DELAY_SAMPLE=1`
++  together: 25.7 tok/s vs 26.1 baseline. The `cudaGraphLaunch` cost they were
++  meant to hide is 0.1 ms, not 2 ms.
++- **`cudaGraphLaunch` "2 ms".** Under `/start_profile` the decode graph's
++  replay shows ~2.0-2.3 ms on every stage; measured in-situ it is **0.08-0.11
++  ms** (670 nodes, ~0.15 us/node). Two mistakes fed this: the profiler inflates
++  the API, and clustering kernels by >0.5 ms gaps splits a step into ~4
++  fragments, which made GPU busy look like 2 ms out of a 60 ms period.
++- **Decode graph node count as a lever.** Node census via
++  `cudaGraphGetNodes`/`cudaGraphNodeGetType` (torch's `raw_cuda_graph()` needs
++  `CUDAGraph(keep_graph=True)`; `cudaGraphDebugDotPrint` returns rc=1 on this
++  driver): 592 nodes at PP0, 670 at PP3, 99% kernel nodes, 4 memcpy, 1-2 event
++  nodes. No hidden multi-stream structure, and at a real 0.15 us/node there is
++  nothing to win by fusing small kernels.
++- **Whole-row gather rewrite of the MLA kernel.** One gather of the full
++  [16, 512] row plus a single k=512 QK dot, instead of 8 chunked dots: bit
++  identical output, **2.25x slower** (48.4 vs 21.5 ms at B=512/TOPK=512). The
++  wide dot's register staging reproduces exactly the cost the chunking avoids.
++- **DSPark speculative decoding.** The checkpoint ships it
++  (`dspark_block_size=5`, `dspark_target_layer_ids=[40,41,42]`,
++  `mtp.2.markov_head.*`), but the framework rejects it for anything but
++  `pp_size == 1` unless it is a PD-disaggregated prefill instance, and 8 cards
++  cannot host both roles (weights are 96.8% of each card at 1/8 sharding).
++- **EAGLE/MTP speculative decoding.** Passes validation for this architecture
++  (`--speculative-algorithm EAGLE --speculative-eagle-topk 1`, plus
++  `SGLANG_ENABLE_PP_SPEC=1` for PP) and then OOMs: under PP the draft keeps its
++  own copy of the input embedding on the last stage (129280x4096 fp16 = 1010 MiB
++  per call) where 0.79 GiB is free after weights. Lowering `--mem-fraction-static`
++  does not help because the KV pool is allocated after the draft. Making that
++  embedding shard-local and fp8 would fit, at the cost of ~60% of the KV pool.
++- **Kernel-argument count as a graph-launch cost.** Synthetic 600-node graphs:
++  1 arg 1.13 us/node, 3 args 1.52, 25 args 1.14. Not a factor.
++- **HS kernel knobs.** `SGLANG_SM75_HS_{NCOL,WARPS,STAGES,TRANS}` swept
++  interleaved at the prefill shape: the shipped NCOL=64 / W4 / S2 / transposed
++  is the optimum, no >10% win anywhere.
++- **The interconnect.** Topology is four NVLink pairs, (0,1) (2,3) (4,5) (6,7);
++  `TP2 x PP4` puts the TP all-reduce inside a pair and only the PP handoff on
++  PCIe. Measured D2D with the link under load:
++
++  | pair | path | P2P | 256 MB | 8 KB latency |
++  |------|------|-----|---------|--------------|
++  | 0<->1 | NVLink pair (where TP2 lands) | yes | **87.3 GB/s** | 46 us |
++  | 0<->2 | PIX, same PCIe switch | no | 10.3 GB/s | 50 us |
++  | 0<->4 | PHB, across host bridge (PP path) | no | 10.25 GB/s | 48 us |
++  | 0<->6 | PHB, across host bridge (PP path) | no | 10.27 GB/s | 50 us |
++
++  So the high-volume path never touches PCIe, and the PCIe path carries almost
++  nothing: 8 KB per stage per token at decode (0.15 ms/token, 0.4% of 38.3 ms)
++  and 4 MB per boundary per 512-token prefill chunk (1.2 ms of a 57 ms chunk,
++  ~2%). GeForce cards have no P2P across PCIe, so cross-pair traffic is
++  host-staged, but at these volumes it does not matter, and no PP placement
++  escapes the 10.3 GB/s ceiling (PIX and PHB measure the same). Rejected as a
++  bottleneck on measurement, not on estimate.
++
++## Concurrency is the remaining headroom
++
++| concurrent requests | aggregate | per request |
++|---------------------|-----------|-------------|
++| 1 | 25.2 tok/s | 25.2 |
++| 2 | 39.5 | 19.7 |
++| 4 | 65.6 | 16.4 |
++| 8 | 132.2 | 16.5 |
++
++5.2x from 1 to 8, so the batch-1 point is latency-shaped, not capacity-shaped.
++Note `--cuda-graph-max-bs-decode 2` in the shipped launcher: batch >2 runs
++eager. Raising the graphed batch range is untested and is the cheapest thing
++left to try for multi-request serving.
++
++## What is actually left
++
++Small, in order of effort:
++
++1. **hc_pre cublas chain** (0.22 ms/step, 0.9 ms/token, ~1%). The trace shows
++   `dot_kernel` (grid 32x1x24, 8 us) + `reduce_1Block_kernel` (3 us) sitting
++   between `_hc_prenorm_smallm_kernel` and `hc_split_sinkhorn_kernel`, i.e.
++   inside the MHC pre-mix statistics, one pair per layer. Folding them into the
++   prenorm kernel is the same move as the cast+rms fusion.
++2. **46 `FillFunctor` zero-fills per step** (0.09 ms/step, ~1%). Inside a
++   captured decode graph most of these buffers are fully overwritten; they
++   should not need clearing every step.
++3. **MoE k-split at decode** (medium effort, 3-5%). `SGLANG_SM75_W4A16_KSPLIT=2`
++   is already the measured optimum at bs=1 (NT4+KS2: 0.087/0.048 ms vs NT4 KS1
++   0.116/0.060), and the source records why KS4/KS8 do not pay: `sorted_ids` is
++   the align buffer's *capacity* (3861 rows at decode) rather than the 6 live
++   rows, so each split carries a 63 MB fp32 partial that costs as much as the
++   GEMM (KS1 0.115, KS2 0.116, KS4 0.116 ms). Sizing the align/partial buffers
++   to live rows for the decode graph -- bs is known at capture time, so this
++   does not need a device-side `num_valid` -- would let the wider grids that
++   measured 337 GB/s at 1536 blocks and 388 at 6144 actually apply. Then sweep
++   the cfgs already present in `W4A16_V3_CFGS` / `_KS_CFG`.
++4. **All-reduce kernel efficiency, prefill only** (~6% of a chunk, and the only
++   interconnect-adjacent item left). The TP all-reduce runs on NVLink at
++   87 GB/s, but an EXTEND event of 4 MB takes 0.216 ms, i.e. 18.5 GB/s -- a
++   fifth of the link. Getting each event to link speed would save ~3.7 ms per
++   512-token chunk. This is the kernel, not the wire, so it is invisible in any
++   bandwidth check of the interconnect.
++
++## Pitfalls that cost real time
++
++- **Synthetic KV cache layout.** A bench that fills a page as
++  `page_off + t*584 + 448` is wrong: the page stride is 584 but the token stride
++  inside a page is 576 (`_HS_TOKEN_BYTES`). The rope bytes then hold random
++  values, bf16 pairs like 0x6464 are ~2^73, the cast to fp16 is `inf`, and
++  `0 * inf` in the rope dot makes the kernel emit NaN for *every* input -- it
++  looks exactly like a kernel bug. Sanity check that survives: a constant
++  payload with rope zeroed at the right offset must give a constant output.
++- **e4m3 NaN byte.** Payload byte 127 (and 255) are NaN in the lookup table.
++  Bench payloads must be `randint(0, 127)`, not `randint(0, 256)`.
++- **`nvidia-smi` PCIe generation at idle.** `pcie.link.gen.current` reports 1 on
++  all eight cards while nothing is running (ASPM downclock); the link trains to
++  Gen3 under load, which is what the 10.3 GB/s D2D numbers above are. Judge the
++  link by a copy benchmark, not by the idle reading.
++- **Profiling then loading.** A server that has run `/start_profile` should be
++  restarted before it serves real load; twice in one session we lost a run to a
++  crash that a restart fixed.
++- **Self-measured "free" GPU time.** Kernel durations from kineto are
++  trustworthy; API durations are not, and neither are gaps you inferred by
++  clustering kernels.
 diff --git a/python/sglang/kernels/jit/csrc/deepseek_v4/rope.cuh b/python/sglang/kernels/jit/csrc/deepseek_v4/rope.cuh
 index f0fda254b8..7c01c5e39d 100644
 --- a/python/sglang/kernels/jit/csrc/deepseek_v4/rope.cuh
@@ -896,109 +1014,94 @@ index 0000000000..acad8d5eb3
 +}  // namespace sglang
 diff --git a/python/sglang/kernels/ops/attention/dsa/triton_mqa_logits.py b/python/sglang/kernels/ops/attention/dsa/triton_mqa_logits.py
 new file mode 100644
-index 0000000000..ac05ceeae2
+index 0000000000..100507721f
 --- /dev/null
 +++ b/python/sglang/kernels/ops/attention/dsa/triton_mqa_logits.py
-@@ -0,0 +1,136 @@
-+"""Triton FP8 MQA logits for the DSA indexer on GPUs without FP8 tensor cores.
+@@ -0,0 +1,349 @@
++"""FP8 MQA logits for the DSA indexer on GPUs without FP8 tensor cores.
 +
-+Replaces ``deep_gemm.fp8_mqa_logits`` on sub-90 (SM75/SM80). SM75 Triton has
-+no e4m3 cast, so q/k are dequantized to fp16 with torch elementwise ops first
-+(cheap: q is [Q, H, 128], k is [K, 128]); the kernel then runs the fp16 tensor
-+cores (Turing mma.sync) with the DeepGEMM semantics:
++Replaces ``deep_gemm.fp8_mqa_logits`` on sub-90 (SM75/SM80) with the DeepGEMM
++semantics:
 +
 +    logits[q, j] = sum_h weights[q, h] * relu(dot(q[q, h], k[j])) * k_scale[j]
 +                   for ks[q] <= j < ke[q], else 0.
 +
-+SMEM budget: SM75 has 64 KB. The real indexer shape is H=64 heads x D=128, so
-+loading all heads of a q-row block at once (BLOCK_Q*H*D*2 = 128 KB) does not
-+fit; the head dimension is tiled (BLOCK_H) and accumulated in registers.
++The Triton ``tl.dot`` path was measured at ~1.5 TFLOP-equivalent on SM75:
++this Triton build lowers every fp16 dot (even a vanilla matmul) to scalar
++FFMA instead of mma.sync, and a cross-warp head reduce inside the key loop
++adds a serialized shared-memory round-trip on top. cuBLAS fp16 tensor-core
++GEMMs are ~30x faster, so the fallback is a key-chunked GEMM + epilogue:
 +
-+  q:     [Q, H, D] fp16
-+  k:     [K, D]    fp16
-+  k_scale: [K]     fp32
-+  weights: [Q, H]  fp32
-+  ks, ke:  [Q]     int32
-+  out:     [Q, max_seqlen_k] fp32
++  1. dequantize q/k to fp16 once (fp8->fp16 elementwise, negligible),
++  2. per key chunk: s = q2d @ k_chunk^T on tensor cores ([Q*H, C]),
++  3. relu, then a strided-batched fp16 GEMM contracts the head axis against
++     weights ([Q, 1, H] x [Q, H, C]),
++  4. scale by k_scale and mask to [ks, ke) (outside the range reads as 0,
++     matching the reference the topk transform consumes).
++
++Chunking bounds the [Q*H, C] score tile; at C=1024 it is Q*2 KB fp16.
++
++fp16 range: both GEMMs above land in fp16, so the operands have to be
++pre-scaled. The indexer quantizes every q and k row with absmax scaling
++(``scale = absmax / FP8_E4M3_MAX`` in the fused rope+hadamard+quant kernel),
++so a dequantized row reaches 448 and a D=128 dot of two such rows reaches
++``D * 448 * 448 = 2.6e7`` -- fp16 tops out at 65504, and an unscaled GEMM
++saturates every real logit tile to inf, which turns the top-k into an
++arbitrary prefix of the page range. ``_plan_scales`` divides a power of two
++out first (exact in fp16, and relu is positively homogeneous so it commutes
++with the scale) and the inverse goes back in fp32. Accuracy left over is the
++fp16 pipeline's ~5e-4 relative, which is better than the bf16 torch fallback
++upstream uses on the same hardware.
 +"""
 +
++import math
++
 +import torch
-+import triton
-+import triton.language as tl
++
++_CHUNK = 1024
++
++# Comfortably below fp16 max (65504). The scales are exact powers of two, so
++# this only has to cover the slack left by the log2 rounding in _pow2_floor.
++_FP16_HEADROOM = 30000.0
 +
 +
-+@triton.jit
-+def _fp16_mqa_logits_kernel(
-+    q_ptr,  # [Q, H, D] fp16
-+    k_ptr,  # [K, D] fp16
-+    ks_ptr,  # [K] fp32 (k scales)
-+    w_ptr,  # [Q, H] fp32
-+    ks_idx_ptr,  # [Q] int32
-+    ke_idx_ptr,  # [Q] int32
-+    out_ptr,  # [Q, N] fp32
-+    Q,
-+    N,
-+    H: tl.constexpr,
-+    D: tl.constexpr,
-+    BLOCK_Q: tl.constexpr,
-+    BLOCK_K: tl.constexpr,
-+    BLOCK_H: tl.constexpr,
-+):
-+    pid = tl.program_id(0)
-+    offs_q = pid * BLOCK_Q + tl.arange(0, BLOCK_Q)
-+    q_mask = offs_q < Q
++def _pow2_floor(values: float) -> float:
++    """Largest power of two <= ``values`` (positive)."""
++    return math.ldexp(1.0, math.floor(math.log2(values)) - 1)
 +
-+    ks = tl.load(ks_idx_ptr + offs_q, mask=q_mask, other=0)
-+    ke = tl.load(ke_idx_ptr + offs_q, mask=q_mask, other=0)
-+    k_max = tl.max(ke, axis=0)
 +
-+    offs_k = tl.arange(0, BLOCK_K)
-+    offs_bh = tl.arange(0, BLOCK_H)
-+    offs_d = tl.arange(0, D)
-+    num_h_tiles = H // BLOCK_H
++def _plan_scales(
++    q_dtype: torch.dtype,
++    D: int,
++    H: int,
++    weights: torch.Tensor,
++) -> tuple[float, torch.Tensor, torch.Tensor]:
++    """Pick the fp16 range plan for the two GEMMs.
 +
-+    for k0 in range(0, k_max, BLOCK_K):
-+        g_k = k0 + offs_k
-+        k_mask = g_k < k_max
-+        k_v = tl.load(
-+            k_ptr + g_k[:, None] * D + offs_d[None, :],
-+            mask=k_mask[:, None],
-+            other=0.0,
-+        )  # [BLOCK_K, D]
++    Returns ``(q_scale, w_scale, inv)``. ``q_scale`` is a Python float applied
++    to q before the dot GEMM; ``w_scale`` is a 0-dim tensor folded into the
++    weights before the head contraction; ``inv`` undoes both in fp32.
++    """
++    # The dot bound only needs the fp8 dynamic range, not the data: both
++    # operands are absmax-quantized, so |q| , |k| <= FP8_E4M3_MAX always. A
++    # compile-time bound is both cheaper than a reduction and strictly safer
++    # than a data-dependent one.
++    fp8_max = float(torch.finfo(q_dtype).max)
++    q_scale = _pow2_floor(_FP16_HEADROOM / (D * fp8_max * fp8_max))
 +
-+        acc = tl.zeros((BLOCK_Q, BLOCK_K), tl.float32)
-+        for ht in range(0, num_h_tiles):
-+            offs_h = ht * BLOCK_H + offs_bh
-+            # q tile: [BLOCK_Q, BLOCK_H, D] -> [BLOCK_Q*BLOCK_H, D]
-+            q_off = (
-+                offs_q[:, None, None] * (H * D)
-+                + offs_h[None, :, None] * D
-+                + offs_d[None, None, :]
-+            )
-+            q_v = tl.load(q_ptr + q_off, mask=q_mask[:, None, None], other=0.0)
-+            q_v = tl.reshape(q_v, (BLOCK_Q * BLOCK_H, D))
++    # The head contraction is a sum of H weighted terms, so it needs its own
++    # budget: H * w_absmax * w_scale * dot must fit, and dot is bounded by the
++    # headroom above. Capped at 1 -- with small weights the headroom is
++    # already there and scaling up could overflow w * w_scale on its own.
++    w_absmax = weights.abs().amax().float().clamp(min=torch.finfo(torch.float32).tiny)
++    w_scale = torch.exp2(
++        torch.clamp(torch.floor(torch.log2(1.0 / (H * w_absmax))) - 1.0, max=0.0)
++    )
 +
-+            s = tl.dot(q_v, tl.trans(k_v), out_dtype=tl.float32)  # [BQ*BH, BK]
-+            s = tl.maximum(s, 0.0)  # relu
-+            s = tl.reshape(s, (BLOCK_Q, BLOCK_H, BLOCK_K))
-+            w = tl.load(
-+                w_ptr + offs_q[:, None] * H + offs_h[None, :],
-+                mask=q_mask[:, None],
-+                other=0.0,
-+            )  # [BLOCK_Q, BLOCK_H]
-+            acc += tl.sum(s * w[:, :, None], axis=1)  # [BLOCK_Q, BLOCK_K]
-+
-+        k_scale = tl.load(ks_ptr + g_k, mask=k_mask, other=0.0)
-+        acc = acc * k_scale[None, :]
-+
-+        valid = (g_k[None, :] >= ks[:, None]) & (g_k[None, :] < ke[:, None])
-+        acc = tl.where(valid, acc, 0.0)
-+
-+        tl.store(
-+            out_ptr + offs_q[:, None] * N + g_k[None, :],
-+            acc,
-+            mask=q_mask[:, None] & k_mask[None, :],
-+        )
++    # The fp16 result carries one factor of q_scale (scaling q scales the dot
++    # linearly) and one of w_scale.
++    inv = 1.0 / (q_scale * w_scale)
++    return q_scale, w_scale, inv
 +
 +
 +def fp16_mqa_logits_triton(
@@ -1009,33 +1112,281 @@ index 0000000000..ac05ceeae2
 +    ks: torch.Tensor,  # [Q] int32
 +    ke: torch.Tensor,  # [Q] int32
 +    out: torch.Tensor,  # [Q, N] float32
-+    block_q: int = 8,
-+    block_k: int = 64,
-+    block_h: int = 8,
++    chunk: int = _CHUNK,
 +) -> torch.Tensor:
 +    Q, H, D = q_fp8.shape
-+    q16 = q_fp8.to(torch.float16)
++    if Q <= 16:
++        from sglang.srt.environ import envs
++
++        if envs.SGLANG_SM75_FUSE_INDEXER_LOGITS.get():
++            return mqa_logits_smallq(q_fp8, k_fp8, k_scale, weights, ks, ke, out)
++    N = out.shape[1]
++    K = k_fp8.shape[0]
 +    k16 = k_fp8.to(torch.float16)
-+    grid = (triton.cdiv(Q, block_q),)
-+    _fp16_mqa_logits_kernel[grid](
-+        q16,
-+        k16,
++    q16 = q_fp8.reshape(Q, H, D).to(torch.float16)
++
++    q_scale, w_scale, inv = _plan_scales(q_fp8.dtype, D, H, weights)
++    if q_scale != 1.0:
++        q16 = (q16 * q_scale).reshape(Q * H, D)
++    w16 = (weights * w_scale).to(torch.float16).unsqueeze(1)  # [Q, 1, H]
++    inv = inv.to(torch.float32)
++    ks_i = ks.to(torch.int64).unsqueeze(1)
++    ke_i = ke.to(torch.int64).unsqueeze(1)
++
++    # k_fp8 holds the gathered compressed keys and can be shorter than N,
++    # which is page-rounded (max_seqlen_k); only the real keys carry logits.
++    n_scored = min(N, K)
++    for c0 in range(0, n_scored, chunk):
++        c1 = min(c0 + chunk, n_scored)
++        s = torch.mm(q16, k16[c0:c1].t())  # [Q*H, C] fp16, tensor cores
++        s.relu_()
++        acc = torch.bmm(w16, s.view(Q, H, c1 - c0)).float()  # [Q, 1, C]
++        acc = acc.squeeze(1) * inv * k_scale[c0:c1].unsqueeze(0)
++        cols = torch.arange(c0, c1, device=out.device, dtype=torch.int64)
++        acc.masked_fill_((cols < ks_i) | (cols >= ke_i), 0.0)
++        out[:, c0:c1] = acc
++    if n_scored < N:
++        # The tail is page padding with no key behind it. Callers allocate the
++        # logits with new_empty, so leaving it undefined would hand the top-k
++        # whatever the allocator last left in that block.
++        out[:, n_scored:].zero_()
++    return out
++
++
++import triton
++import triton.language as tl
++
++from sglang.kernels.ops.quantization.fp8_w8a16 import _e4m3_to_f16, fp8_payload_lut
++
++
++
++
++
++
++@triton.jit
++def _mqa_logits_smallq_kernel(
++    q_ptr,  # [Q, H, D] uint8-viewed float8_e4m3fn
++    k_ptr,  # [K, D] uint8-viewed float8_e4m3fn
++    ks_ptr,  # [K] float32 per-key scales
++    w_ptr,  # [Q, H] float32
++    lo_ptr,  # [Q] int32 first scored column
++    hi_ptr,  # [Q] int32 end of scored range
++    out_ptr,  # [Q, N] float32
++    k_n,
++    n_cols,
++    stride_q0,
++    stride_qh,
++    stride_wq,
++    stride_on,
++    H: tl.constexpr,
++    D: tl.constexpr,
++    BLOCK_T: tl.constexpr,
++):
++    """logits[q, t] = k_scale[t] * sum_h w[q,h] * relu(q[q,h] . k[t]) on [lo, hi).
++
++    The sub-90 stand-in for deep_gemm's fp8_paged_mqa_logits: the torch chain
++    it replaces (fp8->fp16 copies of q and k, an fp16 mm, an fp16 head bmm and
++    a masked_fill -- ~25 launches and ~1 ms of eager wall per indexer layer at
++    decode) collapses to this one launch. One q row per program: at decode
++    q_n is 1, and owning a single [D] row of q per head turns every dot into a
++    broadcasted [BLOCK_T, D] product, which keeps the whole kernel off the
++    tl.dot operand-staging path that costs more than the math on sm75.
++    Products are fp16 (the precision of the torch mm this replaces), the head
++    sum is fp32.
++    """
++    pid_t = tl.program_id(0)
++    q = tl.program_id(1)
++    offs_t = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
++    offs_d = tl.arange(0, D)
++    t_ld = tl.minimum(offs_t, k_n - 1)
++
++    kt = _e4m3_to_f16(tl.load(k_ptr + t_ld[:, None] * D + offs_d[None, :]))
++    acc = tl.zeros((BLOCK_T,), dtype=tl.float32)
++    for h in range(H):
++        qh = _e4m3_to_f16(tl.load(q_ptr + q * stride_q0 + h * stride_qh + offs_d))
++        s = tl.sum((kt * qh[None, :]).to(tl.float32), axis=1)
++        wh = tl.load(w_ptr + q * stride_wq + h)
++        acc += wh * tl.maximum(s, 0.0)
++
++    lo = tl.load(lo_ptr + q)
++    hi = tl.load(hi_ptr + q)
++    keep = (offs_t >= lo) & (offs_t < hi) & (offs_t < k_n)
++    scale = tl.load(ks_ptr + t_ld)
++    out = tl.where(keep, acc * scale, 0.0)
++    tl.store(out_ptr + q * stride_on + offs_t, out, mask=offs_t < n_cols)
++
++
++def mqa_logits_smallq(
++    q_fp8: torch.Tensor,
++    k_fp8: torch.Tensor,
++    k_scale: torch.Tensor,
++    weights: torch.Tensor,
++    ks: torch.Tensor,
++    ke: torch.Tensor,
++    out: torch.Tensor,
++    block_t: int = 32,
++) -> torch.Tensor:
++    """Decode-shape (Q <= 16) path; see _mqa_logits_smallq_kernel.
++
++    Same arguments as fp16_mqa_logits_triton.
++    """
++    Q, H, D = q_fp8.shape
++    if Q > 16:
++        raise ValueError("mqa_logits_smallq serves Q <= 16")
++    K = k_fp8.shape[0]
++    N = out.shape[1]
++    q_b = q_fp8.view(torch.uint8) if q_fp8.dtype != torch.uint8 else q_fp8
++    k_b = k_fp8.view(torch.uint8) if k_fp8.dtype != torch.uint8 else k_fp8
++    _mqa_logits_smallq_kernel[(triton.cdiv(N, block_t), Q)](
++        q_b,
++        k_b,
 +        k_scale,
 +        weights,
 +        ks,
 +        ke,
 +        out,
-+        Q,
-+        out.shape[1],
++        K,
++        N,
++        q_fp8.stride(0),
++        q_fp8.stride(1),
++        weights.stride(0),
++        out.stride(0),
 +        H=H,
 +        D=D,
-+        BLOCK_Q=block_q,
-+        BLOCK_K=block_k,
-+        BLOCK_H=block_h,
++        BLOCK_T=block_t,
 +        num_warps=4,
 +        num_stages=1,
 +    )
 +    return out
++
++
++@triton.jit
++def _mqa_paged_smallq_kernel(
++    q_ptr,  # [B, H, D] uint8-viewed float8_e4m3fn
++    kvc_ptr,  # [num_pages, 64 * (D + 4)] uint8 page rows: D payload + D/32 fp32... see wrapper
++    pt_ptr,  # [B, max_pages] int64 page table, -1 = hole
++    seq_ptr,  # [B] sequence lengths
++    w_ptr,  # [B, H] float32
++    out_ptr,  # [B, n_out] float32
++    max_pages,
++    n_out,
++    stride_qb,
++    stride_qh,
++    stride_pb,
++    stride_wb,
++    stride_ob,
++    PAGE: tl.constexpr,
++    H: tl.constexpr,
++    D: tl.constexpr,
++    BLOCK_T: tl.constexpr,
++):
++    """Paged variant of _mqa_logits_smallq_kernel for the indexer caches.
++
++    Page rows hold [PAGE * D] payload bytes followed by PAGE fp32 per-key
++    scales, so a strip's gather is page_table-driven. Holes (page -1) and
++    columns past seq_lens store zero, matching the torch chain's clamp-then-
++    mask. One q row per program (batch axis of the grid); the same
++    dot-free formulation as the non-paged kernel.
++    """
++    pid_t = tl.program_id(0)
++    b = tl.program_id(1)
++    offs_t = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
++    offs_d = tl.arange(0, D)
++    page = offs_t // PAGE
++    row = offs_t % PAGE
++    in_t = offs_t < n_out
++    pidx = tl.minimum(page, max_pages - 1)
++    phys = tl.load(pt_ptr + b * stride_pb + pidx)
++    valid = (page < max_pages) & (phys >= 0)
++    phys_s = tl.maximum(phys, 0)
++
++    byte_base = kvc_ptr + phys_s[:, None] * (PAGE * (D + 4)) + row[:, None] * D
++    kt = _e4m3_to_f16(tl.load(byte_base + offs_d[None, :]))
++    acc = tl.zeros((BLOCK_T,), dtype=tl.float32)
++    for h in range(H):
++        qh = _e4m3_to_f16(tl.load(q_ptr + b * stride_qb + h * stride_qh + offs_d))
++        s = tl.sum((kt * qh[None, :]).to(tl.float32), axis=1)
++        wh = tl.load(w_ptr + b * stride_wb + h)
++        acc += wh * tl.maximum(s, 0.0)
++
++    scale = tl.load(
++        kvc_ptr.to(tl.pointer_type(tl.float32))
++        + phys_s * (PAGE * (D + 4)) // 4
++        + PAGE * D // 4
++        + row,
++    )
++    seq = tl.load(seq_ptr + b)
++    keep = valid & (offs_t < seq)
++    tl.store(
++        out_ptr + b * stride_ob + offs_t,
++        tl.where(keep, acc * scale, 0.0),
++        mask=in_t,
++    )
++
++
++def mqa_paged_smallq(
++    q_fp8: torch.Tensor,  # [B, 1, H, D] fp8
++    kvcache_fp8: torch.Tensor,  # [pages, PAGE, 1, D+4] uint8-viewed
++    weight: torch.Tensor,  # [B, H] f32
++    seq_lens: torch.Tensor,  # [B]
++    page_table: torch.Tensor,  # [B, max_pages] int64
++    max_seq_len: int,
++    out: torch.Tensor,  # [B, max_seq_len]
++) -> torch.Tensor:
++    """Paged decode-shape indexer logits; see _mqa_paged_smallq_kernel."""
++    bsz, _, H, D = q_fp8.shape
++    if bsz > 16:
++        raise ValueError("mqa_paged_smallq serves B <= 16")
++    page = kvcache_fp8.shape[1]
++    kvc = kvcache_fp8.view(-1, page * (D + 4))
++    kvc_b = kvc if kvc.dtype == torch.uint8 else kvc.view(torch.uint8)
++    q_b = (
++        q_fp8[:, 0].view(torch.uint8)
++        if q_fp8.dtype != torch.uint8
++        else q_fp8[:, 0]
++    )
++    _mqa_paged_smallq_kernel[(triton.cdiv(max_seq_len, 32), bsz)](
++        q_b,
++        kvc_b,
++        page_table,
++        seq_lens,
++        weight,
++        out,
++        page_table.shape[1],
++        max_seq_len,
++        q_fp8.stride(0),
++        q_fp8.stride(2),
++        page_table.stride(0),
++        weight.stride(0),
++        out.stride(0),
++        PAGE=page,
++        H=H,
++        D=D,
++        BLOCK_T=32,
++        num_warps=4,
++        num_stages=1,
++    )
++    return out
+diff --git a/python/sglang/kernels/ops/attention/dsv4/__init__.py b/python/sglang/kernels/ops/attention/dsv4/__init__.py
+index a92f72bb1a..d36c8c8f2b 100644
+--- a/python/sglang/kernels/ops/attention/dsv4/__init__.py
++++ b/python/sglang/kernels/ops/attention/dsv4/__init__.py
+@@ -26,6 +26,7 @@ from .fp8_wo_a import sglang_per_token_group_quant_fp8_dsv4_wo_a
+ from .topk import (
+     plan_topk_v2,
+     topk_transform_paged,
++    topk_transform_paged_triton,
+     topk_transform_paged_v2,
+     topk_transform_ragged_v2,
+ )
+@@ -50,6 +51,7 @@ __all__ = [
+     "get_paged_mqa_logits_metadata",
+     "triton_create_paged_compress_data",
+     "topk_transform_paged",
++    "topk_transform_paged_triton",
+     "topk_transform_paged_v2",
+     "topk_transform_ragged_v2",
+     "plan_topk_v2",
 diff --git a/python/sglang/kernels/ops/attention/dsv4/elementwise.py b/python/sglang/kernels/ops/attention/dsv4/elementwise.py
 index c0ab88af3e..75e0bf156d 100644
 --- a/python/sglang/kernels/ops/attention/dsv4/elementwise.py
@@ -1072,8 +1423,156 @@ index c0ab88af3e..75e0bf156d 100644
      module.forward(q, k, freqs_real, positions, inverse)
  
  
+diff --git a/python/sglang/kernels/ops/attention/dsv4/topk.py b/python/sglang/kernels/ops/attention/dsv4/topk.py
+index a68cb99bb9..f436c12b82 100644
+--- a/python/sglang/kernels/ops/attention/dsv4/topk.py
++++ b/python/sglang/kernels/ops/attention/dsv4/topk.py
+@@ -3,6 +3,8 @@ from __future__ import annotations
+ from typing import Optional
+ 
+ import torch
++import triton
++import triton.language as tl
+ 
+ from sglang.kernels.jit.utils import (
+     cache_once,
+@@ -101,6 +103,134 @@ def topk_transform_bf16_small(
+     )
+ 
+ 
++@triton.jit
++def _topk_transform_paged_triton_kernel(
++    scores_ptr,
++    seq_lens_ptr,
++    page_tables_ptr,
++    out_page_indices_ptr,
++    out_raw_indices_ptr,
++    max_seq_len,
++    stride_scores,
++    page_table_width,
++    stride_page_tables,
++    K: tl.constexpr,
++    K_POW2: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    PAGE_SIZE: tl.constexpr,
++    WRITE_RAW: tl.constexpr,
++):
++    row = tl.program_id(0)
++    seq_len = tl.load(seq_lens_ptr + row)
++    offs_n = tl.arange(0, BLOCK_N)
++    acc = tl.zeros((K_POW2,), dtype=tl.uint64)
++    for start in range(0, seq_len, BLOCK_N):
++        cols = start + offs_n
++        valid = cols < seq_len
++        score = tl.load(
++            scores_ptr + row * stride_scores + cols,
++            mask=valid,
++            other=float("-inf"),
++        )
++        score_bits = score.to(tl.uint32, bitcast=True)
++        sign = tl.full(score_bits.shape, 0x80000000, tl.uint32)
++        key = tl.where(
++            (score_bits & sign) != 0,
++            ~score_bits,
++            score_bits ^ sign,
++        )
++        packed = (key.to(tl.uint64) << 32) | cols.to(tl.uint64)
++        candidate = tl.topk(packed, K_POW2, dim=0)
++        acc = tl.bitonic_merge(acc)
++        acc = tl.maximum(acc, tl.topk(candidate, K_POW2, dim=0))
++    acc = tl.sort(acc, descending=True)
++    offs_k = tl.arange(0, K_POW2)
++    raw = (acc & 0xFFFFFFFF).to(tl.int32)
++    valid = (offs_k < K) & (offs_k < seq_len)
++    page_ids = raw // PAGE_SIZE
++    page_ids = tl.where(valid, page_ids, 0)
++    # page_table_width is a parameter precisely so this bound exists. `raw` is only
++    # known to be < seq_len, which does not imply raw // PAGE_SIZE < width -- the
++    # documented form of this computation (page_table[i, j // page_size]) requires
++    # it. Without it an out-of-range page_id reads past the row and the garbage page
++    # id flows into extra_indices, where the sparse-attention gather -- which only
++    # masks raw >= 0 and is never handed num_pages -- turns it into an illegal
++    # memory access.
++    in_table = valid & (page_ids >= 0) & (page_ids < page_table_width)
++    pages = tl.load(
++        page_tables_ptr + row * stride_page_tables + page_ids,
++        mask=in_table,
++        other=0,
++    )
++    page_indices = pages * PAGE_SIZE + raw % PAGE_SIZE
++    page_indices = tl.where(in_table, page_indices, -1).to(tl.int32)
++    tl.store(
++        out_page_indices_ptr + row * K + offs_k,
++        page_indices,
++        mask=offs_k < K,
++    )
++    if WRITE_RAW:
++        raw = tl.where(valid, raw, -1)
++        tl.store(
++            out_raw_indices_ptr + row * K + offs_k,
++            raw,
++            mask=offs_k < K,
++        )
++
++
++def topk_transform_paged_triton(
++    scores: torch.Tensor,
++    seq_lens: torch.Tensor,
++    page_tables: torch.Tensor,
++    out_page_indices: torch.Tensor,
++    page_size: int,
++    out_raw_indices: Optional[torch.Tensor] = None,
++) -> None:
++    assert scores.ndim == 2
++    assert scores.dtype == torch.float32
++    assert scores.stride(1) == 1
++    assert scores.stride(0) > 0
++    assert seq_lens.ndim == 1 and seq_lens.shape[0] == scores.shape[0]
++    assert page_tables.ndim == 2 and page_tables.shape[0] == scores.shape[0]
++    assert page_tables.stride(1) == 1
++    assert out_page_indices.ndim == 2
++    assert out_page_indices.shape[0] == scores.shape[0]
++    assert out_page_indices.dtype == torch.int32
++    K = out_page_indices.shape[1]
++    K_POW2 = triton.next_power_of_2(K)
++    assert 0 < K <= 1024
++    assert page_size > 0
++    assert page_size & (page_size - 1) == 0
++    if out_raw_indices is None:
++        raw_indices = out_page_indices
++        write_raw = False
++    else:
++        raw_indices = out_raw_indices
++        assert raw_indices.shape == out_page_indices.shape
++        assert raw_indices.dtype == torch.int32
++        write_raw = True
++    BLOCK_N = max(256, min(K_POW2, 1024))
++    grid = (scores.shape[0],)
++    _topk_transform_paged_triton_kernel[grid](
++        scores,
++        seq_lens,
++        page_tables,
++        out_page_indices,
++        raw_indices,
++        scores.shape[1],
++        scores.stride(0),
++        page_tables.shape[1],
++        page_tables.stride(0),
++        K=K,
++        K_POW2=K_POW2,
++        BLOCK_N=BLOCK_N,
++        PAGE_SIZE=page_size,
++        WRITE_RAW=write_raw,
++        num_warps=4,
++        num_stages=1,
++    )
++
++
+ def topk_transform_paged(
+     scores: torch.Tensor,
+     seq_lens: torch.Tensor,
 diff --git a/python/sglang/kernels/ops/attention/flash_mla_sm120.py b/python/sglang/kernels/ops/attention/flash_mla_sm120.py
-index 5267908eee..2c8cc29740 100644
+index 5267908eee..c3867590e1 100644
 --- a/python/sglang/kernels/ops/attention/flash_mla_sm120.py
 +++ b/python/sglang/kernels/ops/attention/flash_mla_sm120.py
 @@ -13,6 +13,7 @@ separate region at the end of each page.
@@ -1234,16 +1733,72 @@ index 5267908eee..2c8cc29740 100644
  
  
  SM120_DECODE_MAX_TOKENS = 64
-@@ -313,7 +435,7 @@ def flash_mla_with_kvcache_sm120(**kwargs):
+@@ -295,6 +417,48 @@ def flashinfer_dsv4_decode_supports_num_heads(num_heads: int, num_tokens: int) -
+     return num_tokens <= decode_max_tokens and num_heads in supported_heads
+ 
+ 
++def _validate_sparse_indices(k_cache, indices, label: str) -> torch.Tensor:
++    """Clamp sparse page indices into the cache, logging any that were outside.
++
++    DIAGNOSTIC, gated on ``SGLANG_VALIDATE_SPARSE_INDICES``.
++
++    Both sparse-decode kernels turn ``indices`` into an address as
++    ``raw // page_size * page_bytes + raw % page_size * TOKEN_BYTES`` and mask it
++    only with ``raw >= 0``. Neither is ever handed ``num_pages`` -- the host
++    computes it and drops it -- so the upper end is unchecked: one stale entry
++    reads off the end of the KV cache and the device raises an illegal memory
++    access, which then surfaces at whatever launch comes next rather than at the
++    one that faulted. Checking here names the offender instead.
++
++    Returns a clamped *copy* when anything was out of range, so the caller's
++    tensor (page-table metadata reused by other layers) is never mutated.
++    """
++    if indices is None or indices.numel() == 0 or k_cache is None:
++        return indices
++    if k_cache.dim() < 2:
++        return indices
++    # The `.any()` below forces a device sync, and syncing while a CUDA graph is
++    # being captured invalidates the capture (cudaErrorStreamCaptureUnsupported),
++    # which kills startup outright. Capture passes are synthetic warmup anyway.
++    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
++        return indices
++    ntok = int(k_cache.shape[0]) * int(k_cache.shape[1])
++    over = indices >= ntok
++    if not bool(over.any()):
++        return indices
++    bad = indices[over]
++    logger.error(
++        "SPARSE_INDICES_OOB [%s]: %d of %d entries outside "
++        "[0, num_pages*page_size=%d), max=%d -- clamping so the device stays alive.",
++        label,
++        int(bad.numel()),
++        int(indices.numel()),
++        ntok,
++        int(bad.max()),
++    )
++    return indices.masked_fill(over, ntok - 1)
++
++
+ def flash_mla_with_kvcache_sm120(**kwargs):
+     """SM120 FlashMLA sparse decode entry point.
+ 
+@@ -313,7 +477,14 @@ def flash_mla_with_kvcache_sm120(**kwargs):
      extra_indices = kwargs.get("extra_indices_in_kvcache")
      extra_topk_length = kwargs.get("extra_topk_length")
  
 -    if _sm120_default_backend == "flashinfer":
++    if envs.SGLANG_VALIDATE_SPARSE_INDICES.get():
++        indices = _validate_sparse_indices(k_cache, indices, "primary")
++        if extra_indices is not None:
++            extra_indices = _validate_sparse_indices(
++                extra_k_cache, extra_indices, "extra"
++            )
++
 +    if _default_backend() == "flashinfer":
          if q.shape[0] > SM120_DECODE_MAX_TOKENS:
              return _flash_mla_sm120_prefill(
                  q,
-@@ -340,7 +462,7 @@ def flash_mla_with_kvcache_sm120(**kwargs):
+@@ -340,7 +511,7 @@ def flash_mla_with_kvcache_sm120(**kwargs):
              extra_topk_length,
          )
  
@@ -1253,7 +1808,7 @@ index 5267908eee..2c8cc29740 100644
              flash_mla_sparse_decode_triton,
          )
 diff --git a/python/sglang/kernels/ops/attention/flash_mla_sm120_triton.py b/python/sglang/kernels/ops/attention/flash_mla_sm120_triton.py
-index 20ffb4d3cb..6f08b12cd0 100644
+index 20ffb4d3cb..fd54b3b2f9 100644
 --- a/python/sglang/kernels/ops/attention/flash_mla_sm120_triton.py
 +++ b/python/sglang/kernels/ops/attention/flash_mla_sm120_triton.py
 @@ -19,12 +19,16 @@ Target: RTX PRO 6000 (SM120, 188 SMs, 99KB SMEM, ~1.5 TB/s GDDR7, 96MB L2)
@@ -1377,16 +1932,113 @@ index 20ffb4d3cb..6f08b12cd0 100644
  
  
  def _apply_attn_sink(
-@@ -319,7 +346,7 @@ def _apply_attn_sink(
+@@ -319,7 +346,104 @@ def _apply_attn_sink(
          torch.exp(lse - combined_lse),
          torch.zeros_like(lse),
      )
 -    return (out.float() * w.unsqueeze(-1)).to(torch.bfloat16), combined_lse
 +    return (out.float() * w.unsqueeze(-1)).to(out.dtype), combined_lse
++
++
++@triton.jit
++def _attn_tail_kernel(
++    o_ptr,  # [P, B*H, D] fp16, partial attention outputs
++    l_ptr,  # [P, B*H] f32, partial log-sum-exp (-inf for empty partials)
++    sink_ptr,  # [H] f32 when HAS_SINK
++    out_ptr,  # [B*H, D] fp16
++    lse_ptr,  # [B*H] f32
++    n_part,
++    H,
++    D,
++    stride_op,
++    stride_ob,
++    stride_lp,
++    HAS_SINK: tl.constexpr,
++    BLOCK_D: tl.constexpr,
++):
++    """One launch for the whole decode attention tail.
++
++    out[b,h] = sum_p exp(lse_p - M) * o_p[b,h] / (sum_p exp(lse_p - M) + exp(sink - M))
++    lse[b,h] = M + log(sum_p exp(lse_p - M) + exp(sink - M)),  M = max(lse_p, sink)
++
++    which is the associative, commutative closed form of what
++    `_merge_partial_attn` chained N-1 times and then `_apply_attn_sink` did --
++    about 37 aten launches per layer (15 per merge, 7 for the sink, each a
++    1-2 us grid-[1] kernel on [B,H]-sized fp32), 0.7 ms of launch-latency-bound
++    device time per decode step per pipeline stage, and the same tail runs on
++    every EXTEND chunk. The flat form keeps the whole reduction in fp32 where
++    the chain rounded the merged output back to fp16 at each step.
++
++    A partial whose lse is -inf contributes nothing (the guard the torch code
++    spelled out as `where(lse > -1e20, ...)`); a head whose parts are all empty
++    and that has no sink divides by the 1e-20 floor and reports -inf, matching
++    the chain.
++    """
++    pid = tl.program_id(0)
++    b = pid // H
++    h = pid % H
++    offs_d = tl.arange(0, BLOCK_D)
++    d_mask = offs_d < D
++
++    l_base = l_ptr + b * H + h
++    M = float("-inf")
++    for p in range(n_part):
++        lp = tl.load(l_base + p * stride_lp)
++        M = tl.maximum(M, lp)
++    if HAS_SINK:
++        M = tl.maximum(M, tl.load(sink_ptr + h))
++
++    acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
++    total = 0.0
++    o_base = o_ptr + (b * H + h) * stride_ob + offs_d
++    for p in range(n_part):
++        lp = tl.load(l_base + p * stride_lp)
++        w = tl.where(lp > -1e20, tl.exp(lp - M), 0.0)
++        ov = tl.load(o_base + p * stride_op, mask=d_mask, other=0.0).to(tl.float32)
++        acc += w * ov
++        total += w
++    if HAS_SINK:
++        total += tl.exp(tl.load(sink_ptr + h) - M)
++    total = tl.maximum(total, 1e-20)
++
++    tl.store(out_ptr + (b * H + h) * D + offs_d,
++             (acc / total).to(out_ptr.dtype.element_ty), mask=d_mask)
++    tl.store(lse_ptr + b * H + h, M + tl.log(total))
++
++
++def _fused_attn_tail(
++    outs: list,  # each [B, 1, H, D] fp16
++    lses: list,  # each [B, 1, H] f32
++    attn_sink: Optional[torch.Tensor],  # [H] f32
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    """Drop-in for chained _merge_partial_attn calls followed by _apply_attn_sink."""
++    B, _, H, D = outs[0].shape
++    parts = torch.stack([o.squeeze(1).contiguous() for o in outs])
++    part_lse = torch.stack([l.squeeze(1).contiguous() for l in lses])
++    out = torch.empty(B, H, D, dtype=outs[0].dtype, device=outs[0].device)
++    lse = torch.empty(B, H, dtype=torch.float32, device=outs[0].device)
++    sink = attn_sink if attn_sink is not None else part_lse
++    _attn_tail_kernel[(B * H,)](
++        parts,
++        part_lse,
++        sink,
++        out,
++        lse,
++        parts.shape[0],
++        H,
++        D,
++        parts.stride(0),
++        parts.stride(2),
++        part_lse.stride(0),
++        HAS_SINK=attn_sink is not None,
++        BLOCK_D=triton.next_power_of_2(D),
++        num_warps=4,
++    )
++    return out.unsqueeze(1), lse.unsqueeze(1)
  
  
  def flash_mla_sparse_decode_triton(
-@@ -343,22 +370,12 @@ def flash_mla_sparse_decode_triton(
+@@ -343,28 +467,1081 @@ def flash_mla_sparse_decode_triton(
          softmax_scale = q.shape[-1] ** (-0.5)
  
      # Process main cache (SWA)
@@ -1410,9 +2062,26 @@ index 20ffb4d3cb..6f08b12cd0 100644
 +        out_extra, lse_extra = _run_sparse_attention(
 +            q, extra_k_cache, extra_indices, extra_topk_length, softmax_scale
          )
-         out, lse = _merge_partial_attn(out, lse, out_extra, lse_extra)
+-        out, lse = _merge_partial_attn(out, lse, out_extra, lse_extra)
++        if attn_sink is not None and envs.SGLANG_SM75_FUSE_ATTN_TAIL.get():
++            # One Triton launch replaces the chained merge + sink, which is
++            # ~37 aten kernels per layer per step (see _attn_tail_kernel). The
++            # flat form is also more accurate: the chain re-rounds to fp16
++            # once per merge.
++            out, lse = _fused_attn_tail(
++                [out, out_extra], [lse, lse_extra], attn_sink
++            )
++        else:
++            out, lse = _merge_partial_attn(out, lse, out_extra, lse_extra)
  
-@@ -368,3 +385,1053 @@ def flash_mla_sparse_decode_triton(
+     # Apply attention sink
+-    if attn_sink is not None:
++    if attn_sink is not None and not (
++        extra_k_cache is not None
++        and extra_indices is not None
++        and envs.SGLANG_SM75_FUSE_ATTN_TAIL.get()
++    ):
+         out, lse = _apply_attn_sink(out, lse, attn_sink)
  
      # Return format matching PyTorch fallback: (out, lse.permute(0,2,1))
      return out, lse.permute(0, 2, 1)
@@ -2467,7 +3136,7 @@ index 20ffb4d3cb..6f08b12cd0 100644
 +def _headshared_min_batch() -> int:
 +    return int(envs.SGLANG_SM75_HEADSHARED_MIN_BATCH.get())
 diff --git a/python/sglang/kernels/ops/elementwise/elementwise.py b/python/sglang/kernels/ops/elementwise/elementwise.py
-index 85ba16c84a..929a9b3616 100644
+index 85ba16c84a..82716d138c 100644
 --- a/python/sglang/kernels/ops/elementwise/elementwise.py
 +++ b/python/sglang/kernels/ops/elementwise/elementwise.py
 @@ -1,6 +1,7 @@
@@ -2478,7 +3147,7 @@ index 85ba16c84a..929a9b3616 100644
  
  from sglang.kernels.jit.utils import is_arch_support_pdl
  from sglang.srt.utils import is_hip
-@@ -580,3 +581,189 @@ def fused_gate_sigmoid_mul_add(
+@@ -580,3 +581,276 @@ def fused_gate_sigmoid_mul_add(
          final_hidden_states,
          do_add=True,
      )
@@ -2575,6 +3244,8 @@ index 85ba16c84a..929a9b3616 100644
 +    SCALE,
 +    HAS_SCALE: tl.constexpr,
 +    BLOCK: tl.constexpr,
++    USE_SLOT_MAP: tl.constexpr,
++    slot_map_ptr,  # [num_tokens, TOPK] int32, slot of each (token, k), or -1
 +):
 +    """Weighted sum over topk of the routed-expert outputs, in one kernel.
 +
@@ -2583,34 +3254,83 @@ index 85ba16c84a..929a9b3616 100644
 +    whole thing to fp32, multiplies by the routing weights and reduces over topk. That
 +    is 13 kernels and 30.6 us of device time at the decode shape against a ~1 us floor.
 +
-+    Each program owns one (token, hidden block) and walks the padded slots, accumulating
-+    the rows whose owner is this token. The test is on a scalar, so a non-matching slot
-+    costs one compare and no load, and the traffic is exactly topk rows per token.
-+    num_valid is read from the device rather than passed as a value so the launch stays
-+    capturable in a CUDA graph.
-+
 +    Accumulation is fp32 with one cast at the end, matching the torch order: fp32
 +    multiply, fp32 sum over topk, then cast to the output dtype.
++
++    Two ways to find a token's rows, because the right one depends on the shape:
++
++    USE_SLOT_MAP=True walks a precomputed [num_tokens, TOPK] table of slot ids, so
++    the inner loop is exactly TOPK iterations. USE_SLOT_MAP=False keeps the original
++    scan of every padded slot, testing the owner scalar. The scan is fine at decode
++    (a handful of slots) but quadratic-ish at prefill: with 512 tokens x topk 6 the
++    padding runs to ~3072 slots and there are 4096 programs, so it issues ~12.6M
++    scalar owner loads to deliver 24576 row-block loads. The table turns that into
++    6 iterations per program and was measured at prefill shape on a 2080 Ti, where
++    this kernel was 2.7 ms/call -- 9.4% of PP3's device time.
 +    """
 +    tok = tl.program_id(0)
 +    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-+    num_valid = tl.load(num_valid_ptr)
-+    lo = tok * TOPK
-+    hi = lo + TOPK
 +    acc = tl.zeros([BLOCK], dtype=tl.float32)
-+    for s in range(0, num_slots):
-+        owner = tl.load(sorted_ptr + s)
-+        # Invalid means the pad sentinel or a position at or past num_valid, where
-+        # sorted_ids is uninitialised and would otherwise index outside the output.
-+        if (owner >= lo) & (owner < hi) & (s < num_valid):
-+            w = tl.load(weight_ptr + owner)
-+            v = tl.load(down_ptr + s.to(tl.int64) * down_stride + offs)
-+            acc += w * v.to(tl.float32)
++
++    if USE_SLOT_MAP:
++        for k in tl.static_range(TOPK):
++            s = tl.load(slot_map_ptr + tok * TOPK + k)
++            if s >= 0:
++                w = tl.load(weight_ptr + tok * TOPK + k)
++                v = tl.load(down_ptr + s.to(tl.int64) * down_stride + offs)
++                acc += w * v.to(tl.float32)
++    else:
++        num_valid = tl.load(num_valid_ptr)
++        lo = tok * TOPK
++        hi = lo + TOPK
++        for s in range(0, num_slots):
++            owner = tl.load(sorted_ptr + s)
++            # Invalid means the pad sentinel or a position at or past num_valid, where
++            # sorted_ids is uninitialised and would otherwise index outside the output.
++            if (owner >= lo) & (owner < hi) & (s < num_valid):
++                w = tl.load(weight_ptr + owner)
++                v = tl.load(down_ptr + s.to(tl.int64) * down_stride + offs)
++                acc += w * v.to(tl.float32)
 +    if HAS_SCALE:
 +        acc = acc * SCALE
 +    tl.store(
 +        out_ptr + tok.to(tl.int64) * out_stride + offs, acc.to(out_ptr.dtype.element_ty)
 +    )
++
++
++@triton.jit
++def _moe_slot_map_scatter_kernel(
++    sorted_ptr,  # [num_slots] int32 owner = t*topk + k, or the pad sentinel
++    num_valid_ptr,  # [1] int32
++    map_ptr,  # [num_tokens*TOPK] int32, -1 where the pair has no live slot
++    num_slots,
++    NUM_PAIRS,  # num_tokens * topk
++    TOPK: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    """map[t*topk + k] = the slot whose owner is t*topk + k, or -1.
++
++    Scatter, not scan. One program per (owner, slot-block): it reads BLOCK owners,
++    and for each one stores its own position into map[owner]. Every slot is visited
++    exactly once, so this is O(num_slots) total work instead of the
++    O(num_slots * num_tokens * topk) a per-pair scan would do.
++
++    The map is pre-filled with -1 by the caller, so a pair with no live slot (its
++    experts were all filtered out) keeps -1 and the combine kernel skips it. Writing
++    -1 from here too would race: a later slot for the same owner would not be able to
++    tell it had already been written.
++
++    Graph-safe: no nonzero(), no host sync; num_valid is read on the device.
++    """
++    pid = tl.program_id(0)
++    offs = pid * BLOCK + tl.arange(0, BLOCK)
++    mask = offs < num_slots
++    owner = tl.load(sorted_ptr + offs, mask=mask, other=-1)
++    num_valid = tl.load(num_valid_ptr)
++    # Drop the pad sentinel and anything at or past num_valid, where sorted_ids is
++    # uninitialised and could index outside the map.
++    ok = mask & (owner >= 0) & (owner < NUM_PAIRS) & (offs < num_valid)
++    tl.store(map_ptr + owner, offs.to(tl.int32), mask=ok)
 +
 +
 +def moe_combine(
@@ -2622,6 +3342,7 @@ index 85ba16c84a..929a9b3616 100644
 +    topk: int,
 +    scale=None,
 +    out: torch.Tensor = None,
++    use_slot_map: bool = None,
 +):
 +    """out[t] = sum over the topk slots owned by t of weight * down_slots[slot].
 +
@@ -2652,6 +3373,39 @@ index 85ba16c84a..929a9b3616 100644
 +        BLOCK = next(
 +            (b for b in (256, 128, 64, 32, 16, 8, 4, 2, 1) if hidden % b == 0), 1
 +        )
++    # The slot table costs a fixed ~0.13 ms (a fill_ plus a scatter over num_slots)
++    # and turns the inner loop from num_slots to topk. It only pays once the scan is
++    # long enough to dwarf that: measured on a 2080 Ti at H=2048, topk=6,
++    #   B=128 slots=1024 -> scan 0.106 ms, table 0.222 ms  (0.48x, keep the scan)
++    # B=256 slots=1792 -> scan 0.251 ms, table 0.221 ms  (1.13x, break even)
++    #   B=512 slots=3072 -> scan 0.660 ms, table 0.232 ms  (2.85x)
++    #   B=512 slots=4096 -> scan 0.853 ms, table 0.222 ms  (3.84x)
++    # The crossover sits near B=256, i.e. where num_slots >= ~28x topk. The
++    # num_tokens floor keeps small batches out even when the padding ratio is high:
++    # at B=8 a padded num_slots can clear 28x topk while the whole combine is only
++    # tens of microseconds, so the table's fixed cost would dominate. Decode
++    # (B=1, num_slots ~ 8x topk) stays on the scan, which is what it wants.
++    if use_slot_map is None:
++        use_slot_map = num_tokens >= 256 and num_slots >= 28 * topk
++    slot_map = None
++    if use_slot_map:
++        npairs = num_tokens * topk
++        # Filled with -1 first so pairs with no live slot stay -1; the scatter then
++        # writes the real slot ids. fill_ is a device op, so this stays graph-safe.
++        slot_map = torch.full(
++            (npairs,), -1, dtype=torch.int32, device=down_slots.device
++        )
++        SBLOCK = 256
++        _moe_slot_map_scatter_kernel[(triton.cdiv(num_slots, SBLOCK),)](
++            sorted_ids,
++            num_valid,
++            slot_map,
++            num_slots,
++            npairs,
++            TOPK=topk,
++            BLOCK=SBLOCK,
++            num_warps=4,
++        )
 +    _moe_combine_kernel[(num_tokens, hidden // BLOCK)](
 +        down_slots,
 +        sorted_ids,
@@ -2665,6 +3419,8 @@ index 85ba16c84a..929a9b3616 100644
 +        SCALE=1.0 if scale is None else float(scale),
 +        HAS_SCALE=scale is not None,
 +        BLOCK=BLOCK,
++        USE_SLOT_MAP=use_slot_map,
++        slot_map_ptr=slot_map if slot_map is not None else sorted_ids,
 +        num_warps=2 if BLOCK <= 512 else 4,
 +    )
 +    return out
@@ -2690,7 +3446,7 @@ index 50f40afa59..75b3eeb541 100644
      return torch.mm(x.float(), y.float().t())
  
 diff --git a/python/sglang/kernels/ops/layernorm/mhc.py b/python/sglang/kernels/ops/layernorm/mhc.py
-index 78c163f0c3..2bf966efd3 100644
+index 78c163f0c3..75e06eb242 100644
 --- a/python/sglang/kernels/ops/layernorm/mhc.py
 +++ b/python/sglang/kernels/ops/layernorm/mhc.py
 @@ -1357,6 +1357,97 @@ def mhc_post_tilelang(
@@ -2791,6 +3547,57 @@ index 78c163f0c3..2bf966efd3 100644
  def mhc_post(
      x: torch.Tensor,
      residual: torch.Tensor,
+@@ -2734,3 +2825,50 @@ def hc_combine(
+         BLOCK_H=block_h,
+     )
+     return y
++
++
++@triton.jit
++def _hc_prenorm_smallm_kernel(
++    x_ptr,  # [M, HK] bf16, the flattened multi-stream residual
++    xf_ptr,  # [M, HK] f32, the float copy the rest of hc_pre consumes
++    rs_ptr,  # [M] f32, rsqrt(mean(x^2) + eps)
++    hk,
++    eps,
++    BLOCK: tl.constexpr,
++):
++    """x_flat = x.float() and the rms statistic in one launch.
++
++    The compiled torch chain spreads this over four kernels -- a to_copy, a
++    reduce for mean(x^2), a second reduce and a pointwise add/rsqrt -- each a
++    few microseconds and a launch, per layer per decode step. One pass over
++    114 KB per row fits a single program comfortably.
++    """
++    pid = tl.program_id(0)
++    acc = tl.zeros((BLOCK,), dtype=tl.float32)
++    for k0 in range(0, hk, BLOCK):
++        offs = k0 + tl.arange(0, BLOCK)
++        mask = offs < hk
++        xv = tl.load(x_ptr + pid * hk + offs, mask=mask, other=0.0).to(tl.float32)
++        # (x may already be f32; the cast is a no-op then)
++        tl.store(xf_ptr + pid * hk + offs, xv, mask=mask)
++        acc += xv * xv
++    tl.store(rs_ptr + pid, tl.rsqrt(tl.sum(acc, axis=0) / hk + eps))
++
++
++def hc_prenorm_smallm(x_flat_row: torch.Tensor, rms_norm_eps: float):
++    """Row-contiguous x [M, hc*K] (bf16/f16/f32) -> (x_flat f32, rsqrt [M])."""
++    m, hk = x_flat_row.shape
++    if x_flat_row.stride(1) != 1 or x_flat_row.stride(0) != hk:
++        x_flat_row = x_flat_row.contiguous()
++    x_flat = torch.empty((m, hk), dtype=torch.float32, device=x_flat_row.device)
++    rsqrt = torch.empty((m,), dtype=torch.float32, device=x_flat_row.device)
++    _hc_prenorm_smallm_kernel[(m,)](
++        x_flat_row,
++        x_flat,
++        rsqrt,
++        hk,
++        rms_norm_eps,
++        BLOCK=1024,
++        num_warps=8,
++    )
++    return x_flat, rsqrt
 diff --git a/python/sglang/kernels/ops/moe/mxfp4_w4a16_kernels.py b/python/sglang/kernels/ops/moe/mxfp4_w4a16_kernels.py
 new file mode 100644
 index 0000000000..7beb1258ed
@@ -3479,10 +4286,10 @@ index 0000000000..7beb1258ed
 +    return out
 diff --git a/python/sglang/kernels/ops/quantization/fp8_w8a16.py b/python/sglang/kernels/ops/quantization/fp8_w8a16.py
 new file mode 100644
-index 0000000000..43c8827ba0
+index 0000000000..519287f7d3
 --- /dev/null
 +++ b/python/sglang/kernels/ops/quantization/fp8_w8a16.py
-@@ -0,0 +1,731 @@
+@@ -0,0 +1,787 @@
 +"""W8A16: block-scaled FP8 weights read straight from HBM, dequantized in
 +registers, multiplied on the fp16 tensor cores.
 +
@@ -3536,6 +4343,8 @@ index 0000000000..43c8827ba0
 +import triton
 +import triton.language as tl
 +
++from sglang.srt.environ import envs
++
 +BLOCK_SCALE = 128
 +
 +# Above this many activation rows the projection stops being bandwidth bound and
@@ -3559,6 +4368,33 @@ index 0000000000..43c8827ba0
 +
 +
 +@triton.jit
++def _e4m3_to_f16(b):
++    """Exact e4m3fn byte -> fp16, built with integer ops instead of a table.
++
++    The LUT the kernels used to hold this table costs more than the decode it
++    saves: one gather instruction hits up to 32 different L1 sectors per warp,
++    and that L1 traffic serializes against the weight stream. Measured on a
++    4096x4096 tile with everything else in place, removing only the LUT lifts
++    the GEMV from 283 to 450 GB/s.
++
++    For a normal e4m3 the fp16 bits are the exponent field shifted for the
++    bias change (7 -> 15, so +8) with the mantissa seven bits up:
++    `(em << 7) + (8 << 10)`, one shift and one add, and the addition cannot
++    carry into the mantissa because 8 fits in the exponent field alone
++    (e4m3fn is finite, its largest exponent 15 plus 8 stays below fp16
++    inf). Subnormals (em < 8) are m * 2^-9, a three-bit integer times a
++    power of two, exact in either float format.
++    """
++    u = b.to(tl.int32) & 0xFF
++    em = u & 0x7F
++    bits = (em << 7) + (8 << 10)
++    v = bits.to(tl.int16).to(tl.float16, bitcast=True)
++    sub = (u & 0x7).to(tl.float32) * 0.001953125
++    v = tl.where(em < 8, sub.to(tl.float16), v)
++    return tl.where(u < 0x80, v, -v)
++
++
++@triton.jit
 +def _w8a16_gemv_kernel(
 +    x_ptr,
 +    w_ptr,
@@ -3578,6 +4414,7 @@ index 0000000000..43c8827ba0
 +    group_size: tl.constexpr,
 +    rows: tl.constexpr,
 +    even_k: tl.constexpr,
++    alu: tl.constexpr,
 +):
 +    """out [rows, N] = x [rows, K] @ W^T, with W stored [N, K] so k is contiguous.
 +
@@ -3617,7 +4454,10 @@ index 0000000000..43c8827ba0
 +        else:
 +            k_mask = k_start + offs_k < k
 +            w_byte = tl.load(w_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0)
-+        w_deq = tl.load(lut_ptr + w_byte) * scale.to(lut_ptr.dtype.element_ty)
++        if alu:
++            w_deq = _e4m3_to_f16(w_byte) * scale.to(tl.float16)
++        else:
++            w_deq = tl.load(lut_ptr + w_byte) * scale.to(lut_ptr.dtype.element_ty)
 +
 +        if even_k:
 +            xv = tl.load(x_ptr + k_start + offs_k)
@@ -3701,6 +4541,17 @@ index 0000000000..43c8827ba0
 +_WIDE_MAX_GRID = 2048
 +
 +
++def _should_use_w8a16_wide(
++    rows: int, n: int, k: int, allow_k1024: bool = False
++) -> bool:
++    return (
++        _W8A16_WIDE
++        and rows <= 2
++        and (k >= _WIDE_MIN_K or (allow_k1024 and k == 1024))
++        and triton.cdiv(n, 4) <= _WIDE_MAX_GRID
++    )
++
++
 +@triton.jit
 +def _w8a16_gemv_wide_kernel(
 +    x_ptr,
@@ -3719,6 +4570,7 @@ index 0000000000..43c8827ba0
 +    block_k: tl.constexpr,
 +    group_size: tl.constexpr,
 +    rows: tl.constexpr,
++    alu: tl.constexpr,
 +):
 +    """Same GEMV, reading block_k (a multiple of group_size) bytes per row per step.
 +
@@ -3770,12 +4622,16 @@ index 0000000000..43c8827ba0
 +
 +    for k_start in range(0, k, block_k):
 +        w_byte = tl.load(w_ptrs, mask=n_mask[:, None], other=0)
-+        scale = tl.load(s_ptrs).to(lut_ptr.dtype.element_ty)
++        if alu:
++            scale = tl.load(s_ptrs).to(tl.float16)
++            w3 = tl.reshape(_e4m3_to_f16(w_byte), (block_n, n_groups, group_size))
++        else:
++            scale = tl.load(s_ptrs).to(lut_ptr.dtype.element_ty)
++            w3 = tl.reshape(tl.load(lut_ptr + w_byte), (block_n, n_groups, group_size))
 +        # Reshape the dequantized tile to (block_n, n_groups, group_size) first, so the
 +        # per-group scale broadcasts along the middle axis only. Multiplying it against
 +        # the flat (block_n, block_k) tile would line the scales up with the wrong
 +        # columns and nothing would complain.
-+        w3 = tl.reshape(tl.load(lut_ptr + w_byte), (block_n, n_groups, group_size))
 +        w_deq = (w3 * scale[None, :, None]).to(tl.float32)
 +        xv = tl.load(x_ptr + k_start + offs_k).to(tl.float32)
 +        acc0 += tl.reshape(
@@ -3939,6 +4795,7 @@ index 0000000000..43c8827ba0
 +
 +    even_k = k % BLOCK_SCALE == 0
 +    lut = fp8_payload_lut(x.device, x.dtype)
++    alu_deq = envs.SGLANG_SM75_W8A16_ALU_DECODE.get()
 +    out = torch.empty((m, n), dtype=x.dtype, device=x.device)
 +
 +    if m <= _GEMV_MAX_ROWS:
@@ -3978,11 +4835,11 @@ index 0000000000..43c8827ba0
 +        # Two divisibility requirements the narrow kernel does not have: block_k must
 +        # divide k, because these loads are unmasked, and block_n must divide the
 +        # 128-row scale group, because the scale is indexed by a single group per tile.
-+        if (
-+            _W8A16_WIDE
-+            and m <= 2
-+            and k >= _WIDE_MIN_K
-+            and triton.cdiv(n, 4) <= _WIDE_MAX_GRID
++        if _should_use_w8a16_wide(
++            m,
++            n,
++            k,
++            allow_k1024=envs.SGLANG_OPT_W8A16_WIDE_M1_K1024.get(),
 +        ):
 +            # See _WIDE_MIN_K / _WIDE_MAX_GRID for where these two numbers come from.
 +            block_k = 2048
@@ -4006,6 +4863,7 @@ index 0000000000..43c8827ba0
 +                    block_k=block_k,
 +                    group_size=BLOCK_SCALE,
 +                    rows=m,
++                    alu=alu_deq,
 +                    num_warps=4,
 +                    num_stages=4,
 +                )
@@ -4029,6 +4887,11 @@ index 0000000000..43c8827ba0
 +            group_size=BLOCK_SCALE,
 +            rows=m,
 +            even_k=even_k,
++            # The narrow kernel's block_n=64 tiles at the deep-grid shapes are
++            # issue-bound, and the decode's integer ops lose to the gather
++            # there (0.80x at q_b, 0.59x at the LM head shard). The wide
++            # kernel's latency-bound tiles have the issue slots free.
++            alu=False,
 +            num_warps=num_warps,
 +            num_stages=4,
 +        )
@@ -4251,10 +5114,10 @@ index 1422b8ff6f..31e66db2e0 100644
      return all(
          linear.weight.dtype == torch.float8_e4m3fn
 diff --git a/python/sglang/srt/arg_groups/model_hook.py b/python/sglang/srt/arg_groups/model_hook.py
-index edfafe900d..676ff99727 100644
+index edfafe900d..f2604ad4e7 100644
 --- a/python/sglang/srt/arg_groups/model_hook.py
 +++ b/python/sglang/srt/arg_groups/model_hook.py
-@@ -473,6 +473,42 @@ def handle_model_specific_adjustments(server_args: Any):
+@@ -473,6 +473,47 @@ def handle_model_specific_adjustments(server_args: Any):
              envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
              envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
              envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
@@ -4279,8 +5142,13 @@ index edfafe900d..676ff99727 100644
 +                envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.set(False)
 +                envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
 +                envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
-+                if server_args.moe_runner_backend in (None, "auto"):
-+                    server_args.moe_runner_backend = "triton"
++                if cfg.moe_runner_backend in (None, "auto"):
++                    # Resolution does not write to the record, it declares.
++                    declare_resolution(
++                        server_args,
++                        "_handle_model_specific_adjustments",
++                        moe_runner_backend="triton",
++                    )
 +                # The torch top-k path is the only one that can run here (see
 +                # DSATopKBackend._arch_supports_sgl_kernel, which does the
 +                # downgrade at resolve time -- assigning dsa_topk_backend here
@@ -4297,11 +5165,151 @@ index edfafe900d..676ff99727 100644
  
      elif model_arch in ["GptOssForCausalLM"]:
          # Attention backend selection + XPU dtype validation moved to the
+diff --git a/python/sglang/srt/entrypoints/openai/serving_chat.py b/python/sglang/srt/entrypoints/openai/serving_chat.py
+index 6845aa4936..e096064883 100644
+--- a/python/sglang/srt/entrypoints/openai/serving_chat.py
++++ b/python/sglang/srt/entrypoints/openai/serving_chat.py
+@@ -4,6 +4,7 @@ import copy
+ import json
+ import logging
+ import math
++import os
+ import time
+ import uuid
+ from collections import OrderedDict
+@@ -265,6 +266,69 @@ def _build_video_config(request: ChatCompletionRequest) -> dict[str, Any] | None
+     return config or None
+ 
+ 
++# Sampling parameters a deployment can pin for clients that send none.
++# See _sampling_params_override_from_env.
++_SAMPLING_PARAM_NAMES = (
++    "temperature",
++    "top_p",
++    "top_k",
++    "min_p",
++    "repetition_penalty",
++)
++
++
++def _sampling_params_override_from_env(
++    model_defaults: Dict[str, Any],
++) -> Dict[str, Any]:
++    """Deployment override for the default sampling parameters.
++
++    A request that omits the sampling parameters falls back to the checkpoint's
++    ``generation_config.json`` (or, with ``--sampling-defaults openai``, to
++    sglang's own defaults). Both of those are ``temperature=1.0, top_p=1.0``,
++    which is a fine placeholder for "unspecified" and unusable for anything
++    that has to emit structured text: tool-call arguments run to thousands of
++    tokens, and unrestricted sampling over that many steps reliably injects
++    stray tokens into the JSON the caller has to parse. Measured on this box with
++    a 2472-character verbatim-copy prompt: similarity to the target 0.9998 at
++    ``temperature=0`` versus 0.36 at ``temperature=1.0``.
++
++    ``SGLANG_DEFAULT_SAMPLING_PARAMS`` takes a JSON object over the same names,
++    e.g. ``{"temperature": 0.6, "top_p": 0.95}``. It lands in the same dict as
++    the model generation config, so the precedence stays
++    request value > this override > model generation config > sglang default:
++    a client that sets ``temperature`` itself is never overridden. Unset (the
++    default) changes nothing.
++    """
++    raw = os.environ.get("SGLANG_DEFAULT_SAMPLING_PARAMS", "").strip()
++    if not raw:
++        return {}
++    try:
++        parsed = json.loads(raw)
++    except json.JSONDecodeError as exc:
++        raise ValueError(
++            f"SGLANG_DEFAULT_SAMPLING_PARAMS is not valid JSON: {exc}"
++        ) from exc
++    if not isinstance(parsed, dict):
++        raise ValueError(
++            "SGLANG_DEFAULT_SAMPLING_PARAMS must be a JSON object, got "
++            f"{type(parsed).__name__}"
++        )
++    unknown = set(parsed) - set(_SAMPLING_PARAM_NAMES)
++    if unknown:
++        raise ValueError(
++            f"SGLANG_DEFAULT_SAMPLING_PARAMS has unknown key(s) {sorted(unknown)}; "
++            f"supported: {list(_SAMPLING_PARAM_NAMES)}"
++        )
++    if parsed != model_defaults:
++        logger.warning(
++            "Overriding default chat sampling params %s with %s from "
++            "SGLANG_DEFAULT_SAMPLING_PARAMS",
++            model_defaults or "{}",
++            parsed,
++        )
++    return parsed
++
++
+ class OpenAIServingChat(OpenAIServingBase):
+     """Handler for /v1/chat/completions requests"""
+ 
+@@ -303,12 +367,15 @@ class OpenAIServingChat(OpenAIServingBase):
+         self.default_sampling_params = (
+             self.tokenizer_manager.model_config.get_default_sampling_params()
+         )
++        self.default_sampling_params.update(
++            _sampling_params_override_from_env(self.default_sampling_params)
++        )
+         if (
+             self.default_sampling_params
+             and not OpenAIServingChat._default_sampling_params_logged
+         ):
+             logger.info(
+-                f"Using default chat sampling params from model generation config: {self.default_sampling_params}",
++                f"Using default chat sampling params: {self.default_sampling_params}",
+             )
+             OpenAIServingChat._default_sampling_params_logged = True
+ 
+@@ -1583,6 +1650,14 @@ class OpenAIServingChat(OpenAIServingBase):
+                     thinking_mode=thinking_mode,
+                     reasoning_effort=v4_reasoning_effort,
+                     reasoning_effort_profile=reasoning_effort_profile,
++                    # A leading <|begin_of_sentence|> is not what this
++                    # checkpoint was trained to start a chat with: with it,
++                    # greedy decoding emits the BOS token again and keeps
++                    # doing so for the whole budget (measured 2026-09-28 on the
++                    # sub-80 build, short chat turns and 6K-token prompts
++                    # alike). The tokenizer itself adds no BOS
++                    # (add_bos_token is false), so nothing else supplies one.
++                    add_default_bos_token=False,
+                 )
+                 prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+             elif is_dsv41:
 diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
-index c2efb1299e..f1074b3776 100644
+index c2efb1299e..f249927006 100644
 --- a/python/sglang/srt/environ.py
 +++ b/python/sglang/srt/environ.py
-@@ -1099,6 +1099,81 @@ class Envs:
+@@ -486,6 +486,14 @@ class Envs:
+     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
+     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+     SGLANG_VALIDATE_MAMBA_REPLAY_STATE_INDICES = EnvBool(False)
++    # Sparse-decode page indices must stay inside [0, num_pages * page_size). The
++    # Triton kernels that consume them only mask `raw >= 0` and are never handed
++    # num_pages, so a single stale entry sends the gather past the end of the KV
++    # cache and the device raises an illegal memory access. Checking on the host
++    # names the offender instead of letting the fault surface at whatever launch
++    # happens to come next. DIAGNOSTIC: costs a device sync per call, and clamps
++    # (rather than faults) so the run can finish and be observed.
++    SGLANG_VALIDATE_SPARSE_INDICES = EnvBool(False)
+     SGLANG_GDN_DECODE_FUSION_LOG_LAYER_HITS = EnvBool(False)
+     SGLANG_GDN_DECODE_FUSION_VERIFY_REAL_TENSORS = EnvBool(False)
+     # NaN-fill the unified memory pool at boot (debug repro switch).
+@@ -663,6 +671,10 @@ class Envs:
+     # Run PP tensor communication on a dedicated stream so asynchronous sends
+     # do not fence the next forward through the scheduler stream.
+     SGLANG_PP_COMM_OVERLAP = EnvBool(False)
++    # PP: start the proxy-dict send for the current micro-batch before the
++    # result post-processing below, so the send overlaps the host-side work
++    # instead of following it. See SchedulerPPMixin.
++    SGLANG_PP_EARLY_PROXY_SEND = EnvBool(False)
+     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
+ 
+     # ===================================================================
+@@ -1099,6 +1111,121 @@ class Envs:
      # Store DeepSeek-V4 SWA KV directly in FlashInfer's 64-token SM120 page
      # layout. The scheduler continues to allocate 256-token logical pages.
      SGLANG_OPT_SM120_DIRECT_SWA_KV = EnvBool(False)
@@ -4367,6 +5375,46 @@ index c2efb1299e..f1074b3776 100644
 +    # [T, hc_mult, hc_mult, hidden] fp32 twice, which at hidden=4096 and a 512-token
 +    # prefill chunk is ~1 GB of traffic for 4 MB of output. 0 disables it.
 +    SGLANG_SM75_FUSED_HC_POST = EnvInt(1)
++    # Keep the LM head as block-scaled e4m3 instead of bf16 and run it through
++    # the W8A16 GEMV. The checkpoint ships head.weight bf16, so at vocab 129280
++    # and TP2 every decode step on the last PP stage streams 530 MB of weight
++    # for one row (measured 0.908 ms, a cuBLAS gemv, already at the card's read
++    # ceiling -- the only way past it is fewer bytes). fp8 halves the read; the
++    # GEMV measures 0.666 ms for the shard shape against 0.908 for the bf16
++    # gemv. Quantized per 128x128 block at load, same recipe as every dense
++    # layer. Set false to keep the bf16 head (A/B switch).
++    SGLANG_SM75_LMHEAD_FP8 = EnvBool(True)
++    # Decode the e4m3 weight bytes with integer ops instead of the 256-entry
++    # payload LUT load. The gather costs up to 32 distinct L1 sectors per warp
++    # instruction, and that L1 traffic serializes against the weight stream:
++    # on a 4096x4096 GEMV, removing only the LUT measured 283 -> 450 GB/s.
++    # The decode is exact on every non-NaN byte (the checkpoint has no NaNs),
++    # so the weights dequantize to the same numbers. Set false to use the LUT
++    # (A/B switch).
++    SGLANG_SM75_W8A16_ALU_DECODE = EnvBool(True)
++    # Merge the decode attention partials and apply the attention sink in one
++    # Triton launch instead of the chained torch helpers. The helpers are
++    # ~37 aten kernels per layer per step -- maximum/where/exp/fill/logaddexp
++    # over [B,H]-sized fp32, each a 1-2 us grid-[1] launch -- about 0.7 ms of
++    # launch-latency-bound device time per decode step per pipeline stage, and
++    # the same tail runs on every EXTEND chunk. The flat kernel keeps the
++    # reduction in fp32 (the chain re-rounds to fp16 per merge), so it is also
++    # ~2x closer to a float64 reference. Set false for the torch chain.
++    SGLANG_SM75_FUSE_ATTN_TAIL = EnvBool(True)
++    # One Triton pass for the hc_pre float cast + rms statistic on small
++    # batches instead of the inductor chain (to_copy, two reductions and a
++    # pointwise -- ~4 launches per layer per decode step, ~70 us of
++    # launch-latency-bound device time per stage per step at 6-11 layers).
++    # The mix linear stays torch, so the values round identically; only the
++    # sum order of mean(x^2) changes (fp32). Set false for the torch chain.
++    SGLANG_SM75_FUSE_HC_PRE = EnvBool(True)
++    # Indexer MQA logits at decode shape (B <= 16) in one Triton launch
++    # instead of the paged torch chain (page gathers, bf16 widenings, head
++    # bmm, masks -- ~25 kernels per indexer layer per step; ~1 ms of eager
++    # wall per layer outside a graph). The kernel products are fp16, closer
++    # to exact than the chain's bf16. Prefill shapes (B > 16) always keep
++    # the mm-based chain. Set false for the torch chain everywhere.
++    SGLANG_SM75_FUSE_INDEXER_LOGITS = EnvBool(True)
 +    # Comma-separated KV widths to capture a decode CUDA graph for, in addition to
 +    # the context length. DeepSeek-V4 fixes the indexer's logits-row width at
 +    # capture time, so a single graph captured at the full context length makes an
@@ -4379,11 +5427,33 @@ index c2efb1299e..f1074b3776 100644
 +    # only ever be too narrow, which the existing
 +    # `assert actual_max_seq_len <= chosen_max_seq_len` turns into a crash rather
 +    # than silently dropped context. Set empty to disable (one graph per batch size).
-+    SGLANG_DSV4_DECODE_SEQ_LEN_BUCKETS = EnvStr("8192")
++    SGLANG_DSV4_DECODE_SEQ_LEN_BUCKETS = EnvStr("8192,16384,32768,65536,131072")
      SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
      SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
      SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
-@@ -1524,6 +1599,11 @@ class Envs:
+@@ -1135,6 +1262,12 @@ class Envs:
+     SGLANG_CRASH_ON_TRITON_LOAD_AFTER_READY = EnvBool(False)
+     SGLANG_TRITON_SLOW_COMPILE_THRESHOLD_SECS = EnvFloat(1.0)
+     SGLANG_TRITON_LOAD_WARNING_THRESHOLD_GB = EnvFloat(1.0)
++    # DIAGNOSTIC ONLY: synchronize the device after every Triton launch so an
++    # async CUDA fault (e.g. illegal memory access) is reported at the launch
++    # that caused it instead of at some later eager launch. CUDA_LAUNCH_BLOCKING
++    # does not cover Triton, which goes through cuLaunchKernel. Serializes the
++    # device, so never leave this on when collecting throughput numbers.
++    SGLANG_TRITON_SYNC_EVERY_LAUNCH = EnvBool(False)
+     # gfx950 MLA decode stage-1: pick the launch geometry and split count per batch.
+     # Reorders the fp32 accumulation, so off by default.
+     SGLANG_MLA_DECODE_TUNE = EnvBool(False)
+@@ -1300,6 +1433,8 @@ class Envs:
+     # and benchmarks at parity, so this is a consolidation escape hatch, not a perf flip.
+     SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
+     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
++    SGLANG_OPT_USE_SM75_C4_TOPK = EnvBool(False)
++    SGLANG_OPT_W8A16_WIDE_M1_K1024 = EnvBool(False)
+ 
+     # ===================================================================
+     # Kernel selection and fused backends
+@@ -1524,6 +1659,11 @@ class Envs:
      # Model and Quantization
      # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint.
      SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
@@ -4742,7 +5812,7 @@ index 81cfd1af2c..33f4e89844 100644
              self.dim,
              2 * coff * self.head_dim,
 diff --git a/python/sglang/srt/layers/attention/dsv4/indexer.py b/python/sglang/srt/layers/attention/dsv4/indexer.py
-index f0bac3d410..159d35b7fb 100644
+index f0bac3d410..94ad27ab76 100644
 --- a/python/sglang/srt/layers/attention/dsv4/indexer.py
 +++ b/python/sglang/srt/layers/attention/dsv4/indexer.py
 @@ -1,5 +1,6 @@
@@ -4752,7 +5822,15 @@ index f0bac3d410..159d35b7fb 100644
  from typing import (
      TYPE_CHECKING,
      Any,
-@@ -77,6 +78,30 @@ IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+@@ -21,6 +22,7 @@ from sglang.kernels.ops.attention.dsv4 import (
+     fused_q_indexer_rope_hadamard_quant,
+     plan_topk_v2,
+     topk_transform_paged,
++    topk_transform_paged_triton,
+     topk_transform_paged_v2,
+ )
+ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+@@ -77,6 +79,30 @@ IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
  
  _arange_cache = {}
  
@@ -4783,7 +5861,26 @@ index f0bac3d410..159d35b7fb 100644
  
  def fp8_paged_mqa_logits_torch(
      q_fp8: torch.Tensor,
-@@ -109,25 +134,56 @@ def fp8_paged_mqa_logits_torch(
+@@ -106,28 +132,75 @@ def fp8_paged_mqa_logits_torch(
+     SCALE_OFFSET = block_size * head_dim
+     total_dim = block_size * (head_dim + 4)
+ 
++    # One Triton launch for the decode shape (deepseek_v4 runs the indexer on
++    # every 4th layer, and the torch chain below is ~25 kernels -- page
++    # gathers, bf16 widenings, bmm, relu, head sum, masks -- per layer per
++    # step). The kernel also products in fp16 where the chain uses bf16.
++    if envs.SGLANG_SM75_FUSE_INDEXER_LOGITS.get() and batch_size <= 16:
++        from sglang.kernels.ops.attention.dsa.triton_mqa_logits import (
++            mqa_paged_smallq,
++        )
++
++        scores = torch.empty(
++            (batch_size, max_seq_len), dtype=torch.float32, device=kvcache_fp8.device
++        )
++        return mqa_paged_smallq(
++            q_fp8, kvcache_fp8, weight, seq_lens, page_table, max_seq_len, scores
++        )
++
      kvcache_flat = kvcache_fp8.view(-1, total_dim)
  
      pages_clamped = page_table.clamp(min=0)
@@ -4855,7 +5952,46 @@ index f0bac3d410..159d35b7fb 100644
      cache = _arange_cache
      arange_key = f"arange_{padded_seq_len}_{scores.device}"
      if arange_key not in cache:
-@@ -727,6 +783,27 @@ class C4IndexerBackendMixin:
+@@ -565,6 +638,11 @@ class C4IndexerBackendMixin:
+             )
+         return q, weights
+ 
++    def _deepgemm_available(self) -> bool:
++        from sglang.srt.layers import deep_gemm_wrapper
++
++        return deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
++
+     def _can_use_nonpaged_indexer(
+         self,
+         *,
+@@ -592,7 +670,10 @@ class C4IndexerBackendMixin:
+             c4_indexer.use_fp4_indexer
+             or envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
+             or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+-            or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
++            or (
++                envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
++                and self._deepgemm_available()
++            )
+         ):
+             return False
+         if (
+@@ -638,7 +719,13 @@ class C4IndexerBackendMixin:
+         def to_cpu_int_list(values) -> Optional[List[int]]:
+             if isinstance(values, torch.Tensor):
+                 if values.device.type != "cpu":
+-                    return None
++                    # The DSV4 backend sets needs_cpu_seq_lens=False, so the
++                    # scheduler hands us the device tensor. The plan is built
++                    # once per chunk and cached on the metadata, so this
++                    # one-shot sync is amortized over the chunk's layers and is
++                    # far cheaper than the paged torch-logits fallback it
++                    # unlocks (measured 14 ms/layer at a 512-row chunk).
++                    values = values.cpu()
+                 values = values.tolist()
+             return [int(value) for value in values]
+ 
+@@ -727,6 +814,27 @@ class C4IndexerBackendMixin:
          plan: NonPagedIndexerPlan,
          rows: slice,
      ) -> torch.Tensor:
@@ -4883,7 +6019,44 @@ index f0bac3d410..159d35b7fb 100644
          import deep_gemm
  
          return deep_gemm.fp8_mqa_logits(
-@@ -1077,6 +1154,22 @@ class C4IndexerBackendMixin:
+@@ -917,14 +1025,29 @@ class C4IndexerBackendMixin:
+         ) -> None:
+             row_raw_indices = raw_indices[rows] if raw_indices is not None else None
+             if self.dsa_topk_backend.is_torch():
+-                topk_transform_pytorch_vectorized(
+-                    logits,
+-                    c4_seq_lens[rows],
+-                    page_table[rows],
+-                    c4_sparse_page_indices[rows],
+-                    indexer_metadata.compressed_page_size,
+-                    row_raw_indices,
++                use_sm75_triton = (
++                    envs.SGLANG_OPT_USE_SM75_C4_TOPK.get()
++                    and logits.is_cuda
++                    and torch.cuda.get_device_capability(logits.device)[0] == 7
+                 )
++                if use_sm75_triton:
++                    topk_transform_paged_triton(
++                        logits,
++                        c4_seq_lens[rows],
++                        page_table[rows],
++                        c4_sparse_page_indices[rows],
++                        indexer_metadata.compressed_page_size,
++                        row_raw_indices,
++                    )
++                else:
++                    topk_transform_pytorch_vectorized(
++                        logits,
++                        c4_seq_lens[rows],
++                        page_table[rows],
++                        c4_sparse_page_indices[rows],
++                        indexer_metadata.compressed_page_size,
++                        row_raw_indices,
++                    )
+             elif self.dsa_topk_backend.is_flashinfer():
+                 self.flashinfer_topk_transform(
+                     logits,
+@@ -1077,6 +1200,22 @@ class C4IndexerBackendMixin:
                          deep_gemm_metadata[chunk_idx],
                          topk_plans[chunk_idx] if topk_plans is not None else None,
                      )
@@ -4906,7 +6079,7 @@ index f0bac3d410..159d35b7fb 100644
              else:
                  run_paged_indexer(all_rows, deep_gemm_metadata)
  
-@@ -1137,7 +1230,9 @@ class C4Indexer(nn.Module):
+@@ -1137,7 +1276,9 @@ class C4Indexer(nn.Module):
              self.n_heads * self.head_dim,
              bias=False,
              quant_config=quant_config,
@@ -4917,7 +6090,7 @@ index f0bac3d410..159d35b7fb 100644
              prefix=add_prefix("wq_b", prefix),
          )
          expert_pack_quant_config = (
-@@ -1150,7 +1245,9 @@ class C4Indexer(nn.Module):
+@@ -1150,7 +1291,9 @@ class C4Indexer(nn.Module):
              self.n_heads,
              bias=False,
              quant_config=expert_pack_quant_config,
@@ -4928,6 +6101,27 @@ index f0bac3d410..159d35b7fb 100644
              prefix=add_prefix("weights_proj", prefix),
          )
          self.compressor = Compressor(
+diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
+index 77b47df9c9..1abf863b3a 100644
+--- a/python/sglang/srt/layers/logits_processor.py
++++ b/python/sglang/srt/layers/logits_processor.py
+@@ -958,6 +958,16 @@ class LogitsProcessor(nn.Module):
+         lm_head: VocabParallelEmbedding,
+         embedding_bias: Optional[torch.Tensor] = None,
+     ) -> torch.Tensor:
++        weight_fp8 = getattr(lm_head, "weight_fp8", None)
++        if weight_fp8 is not None:
++            from sglang.kernels.ops.quantization.fp8_w8a16 import w8a16_linear
++
++            return w8a16_linear(
++                hidden_states,
++                weight_fp8,
++                lm_head.weight_scale_inv,
++                embedding_bias,
++            )
+         quant_method = getattr(lm_head, "quant_method", None)
+         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
+             # This is a LoRA-wrapped module, use its forward method
 diff --git a/python/sglang/srt/layers/moe/moe_runner/triton_utils/moe_align_block_size.py b/python/sglang/srt/layers/moe/moe_runner/triton_utils/moe_align_block_size.py
 index 9c611a4682..9459e529f7 100644
 --- a/python/sglang/srt/layers/moe/moe_runner/triton_utils/moe_align_block_size.py
@@ -5529,6 +6723,63 @@ index 25b39ae95e..2cc6e9ebb3 100644
  
          if use_intel_amx_backend(layer):
              from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index a7d8baeecc..3fbd6e0ec5 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -1860,6 +1860,7 @@ class Scheduler(
+         # Engine init (graph capture, warmups) is done; from here on any
+         # Triton kernel device-load is a lazy first-use at serving time.
+         triton_load_watch.install()
++        triton_load_watch.install_launch_sync()
+         triton_load_watch.mark_serving_started()
+ 
+         if use_mlx():
+diff --git a/python/sglang/srt/managers/scheduler_pp_mixin.py b/python/sglang/srt/managers/scheduler_pp_mixin.py
+index 71bca7dabf..b893b092bb 100644
+--- a/python/sglang/srt/managers/scheduler_pp_mixin.py
++++ b/python/sglang/srt/managers/scheduler_pp_mixin.py
+@@ -176,6 +176,31 @@ class SchedulerPPMixin:
+                             next_mb_id,
+                         )
+                     )
++                early_proxy_send = (
++                    envs.SGLANG_PP_EARLY_PROXY_SEND.get()
++                    and not self.pp_group.is_last_rank
++                    and cur_batch is not None
++                )
++                if early_proxy_send:
++                    with torch.profiler.record_function(
++                        "send_proxy_dict_to_next_stage"
++                    ):
++                        self.send_proxy_work = self._pp_send_dict_to_next_stage(
++                            result.pp_hidden_states_proxy_tensors.tensors,
++                            async_send=True,
++                            msg_type="proxy",
++                            # ready_event, not a wait on the schedule stream
++                            # here: the wait has to be issued on the comm
++                            # stream the send runs on, which is what the helper
++                            # does with it.
++                            ready_event=self.launch_event,
++                        )
++                    # The commit above reads and clears this flag, so the send
++                    # that happens here has to set it again. Skipping it lets
++                    # the next forward replay a CUDA graph while NCCL is still
++                    # reading the previous step's proxy tensors, which are views
++                    # of replay-owned static buffers.
++                    self.send_proxy_requires_forward_fence = result.can_run_cuda_graph
+                 if self.mbs[next_mb_id] is not None:
+                     d2h_event.synchronize()
+                     process_target = self.mbs[next_mb_id]
+@@ -190,7 +215,7 @@ class SchedulerPPMixin:
+                             next_batch_result,
+                         )
+                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+-                if not self.pp_group.is_last_rank:
++                if not early_proxy_send and not self.pp_group.is_last_rank:
+                     if cur_batch:
+                         self._pp_send_proxy_to_next_stage(result)
+ 
 diff --git a/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py b/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
 index a7b7375411..207d05217d 100644
 --- a/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
@@ -5861,7 +7112,7 @@ index 788ac19b8c..288d02b851 100644
          if model_config.dtype not in supported_dtypes:
              raise ValueError(
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index b6b31eb5cb..62014b49b9 100644
+index b6b31eb5cb..fe898ac9f2 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
 @@ -418,6 +418,20 @@ if _wo_a_aiter_batched_gemm_enabled:
@@ -5936,7 +7187,51 @@ index b6b31eb5cb..62014b49b9 100644
          )
          if quantize_wo_a:
              assert hasattr(self.wo_a, "weight_scale_inv"), (
-@@ -2991,6 +3040,17 @@ class DeepseekV4DecoderLayer(nn.Module):
+@@ -2342,9 +2391,21 @@ class MQALayer(MqaAttentionBase):
+             attn_q = q_padded if q_padded is not None else q
+             save_kv_cache = False
+             if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
+-                o = attn_q.new_empty(
+-                    (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
++                # The head axis here must be n_local_heads, not attn_q's. When
++                # q_padded is in play attn_q carries kernel_num_heads (64 on
++                # SM75/TP2, since _kernel_num_heads only narrows on sm120) while
++                # attn_backend.forward returns TP-local heads (32). Sizing `o`
++                # off attn_q then makes numel exactly tp_size times ret's and
++                # trips the assert in deepseek_v4_attention_with_output at
++                # capture time (16777216 != 8388608 at num_tokens=512).
++                # The eager `unified` branch above avoids this by passing q_out,
++                # the local slice, instead of the padded buffer.
++                o_shape = (
++                    (*attn_q.shape[:-2], self.n_local_heads, self.attn_mqa.v_head_dim)
++                    if attn_q.dim() == 3
++                    else (*attn_q.shape[:-1], self.attn_mqa.v_head_dim)
+                 )
++                o = attn_q.new_empty(o_shape)
+                 bcg_deepseek_v4_attention_with_output(
+                     attn_q,
+                     attn_k,
+@@ -2895,7 +2956,18 @@ class DeepseekV4DecoderLayer(nn.Module):
+             rsqrt = torch.rsqrt(s_out / k + self.rms_norm_eps)
+             mixes = (d_out * rsqrt.unsqueeze(1)).unsqueeze(1)
+         else:
+-            x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
++            if envs.SGLANG_SM75_FUSE_HC_PRE.get() and x.is_cuda and x.shape[0] <= 16:
++                # One Triton pass for the float cast + rms statistic instead of
++                # the compiled 4-kernel chain; the linear stays torch so the
++                # mix values round exactly as before.
++                from sglang.kernels.ops.layernorm.mhc import hc_prenorm_smallm
++
++                x_flat, rsqrt = hc_prenorm_smallm(
++                    x.reshape(x.shape[0], -1), self.rms_norm_eps
++                )
++                mixes = (F.linear(x_flat, hc_fn) * rsqrt.unsqueeze(1)).unsqueeze(1)
++            else:
++                x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
+ 
+         pre, post, comb = _get_mhc_ops().hc_split_sinkhorn(
+             mixes,
+@@ -2991,6 +3063,17 @@ class DeepseekV4DecoderLayer(nn.Module):
              mhc_post(result, x, residual, post, comb)
              return result
  
@@ -5954,997 +7249,67 @@ index b6b31eb5cb..62014b49b9 100644
          assert residual.shape == (x.shape[0], self.hc_mult, x.shape[-1])
          assert post.shape == (x.shape[0], self.hc_mult)
          assert comb.shape == (x.shape[0], self.hc_mult, self.hc_mult)
-@@ -5813,7 +5873,8 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-         weight_f32 * scale.float()[:, None, :, None], "sn bn sk bk -> (sn bn) (sk bk)"
-     )
+@@ -5204,6 +5287,9 @@ class DeepseekV4ForCausalLM(nn.Module):
  
--    return result.to(torch.bfloat16)
-+    # Match the model dtype: fp16 on sub-80 (no native bf16), bf16 elsewhere.
-+    return result.to(torch.get_default_dtype())
+         if is_nextn:
+             return
++
++        if envs.SGLANG_SM75_LMHEAD_FP8.get() and self.pp_group.is_last_rank:
++            self._quantize_lm_head_fp8()
+         for layer_id in range(self.model.start_layer, self.model.end_layer):
+             layer = self.model.layers[layer_id]
+             self_attn = layer.self_attn
+@@ -5219,6 +5305,49 @@ class DeepseekV4ForCausalLM(nn.Module):
+                 self_attn.indexer.compressor.apply_ape_hotfix()
+             layer.refresh_mhc_norm_weight_cache()
  
- 
- def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
-
-From a622747b92dd35f2b3eb8a69ad6d2f13f20afe60 Mon Sep 17 00:00:00 2001
-From: Steven Huang <shuang@myai001.mylab.io>
-Date: Wed, 30 Sep 2026 00:21:56 +0800
-Subject: [PATCH 2/3] perf(sm75): port the opt4 layer (prefill throughput) onto
- the rebased tree
-
-The production wheel is opt3 (the 51-commit branch) plus a second layer of
-edits that only existed in site-packages, released as
-release-sm75-opt4/sm75-optimizations.patch. That patch applies cleanly to the
-51-commit branch; here 5 of its 10 files merged cleanly and 5 needed
-adapting. Same content, same switches.
-
-What opt4 changes:
-
-- fp16 MQA logits (triton_mqa_logits.py): the Triton tl.dot path measured
-  ~1.5 TFLOP-equivalent on SM75, because this Triton build lowers every fp16
-  dot to scalar FFMA and the head reduction adds a serialized shared-memory
-  round-trip. Replaced with a key-chunked cuBLAS fp16 GEMM plus epilogue, with
-  a power-of-two pre-scale so the fp16 tile cannot saturate to inf.
-- topk_transform_paged_triton (dsv4/topk.py): packed-uint64 top-k transform
-  for SM75, behind SGLANG_OPT_USE_SM75_C4_TOPK.
-- moe_combine slot map: replaces the O(num_slots) owner scan with a
-  precomputed [num_tokens, topk] table above B=256; the scan was 2.7 ms/call
-  at prefill shape, 9.4% of PP3's device time.
-- _should_use_w8a16_wide() with the SGLANG_OPT_W8A16_WIDE_M1_K1024 gate.
-- indexer: the nonpaged indexer is now allowed when DeepGEMM is merely
-  unavailable (SGLANG_FP8_PAGED_MQA_LOGITS_TORCH alone used to disable it),
-  which is what routes prefill through the kernel above.
-- serving_chat: SGLANG_DEFAULT_SAMPLING_PARAMS pins the default sampling
-  params, and the DSV4 encoder no longer prepends BOS.
-- deepseek_v4: scope the w1/w2/w3 -> gate_proj/down_proj/up_proj rewrite to
-  expert names (it was rewriting the vision aligner's MLP too and killing the
-  load), and skip unmatched checkpoint tensors instead of raising KeyError.
-- scheduler_pp_mixin: SGLANG_PP_EARLY_PROXY_SEND starts the proxy send before
-  the result post-processing.
-
-Adapted to current main:
-
-- indexer passes indexer_metadata.compressed_page_size (c4_page_size is gone).
-- The early proxy send keeps upstream's ordering and fencing: it passes
-  ready_event=self.launch_event, so the wait lands on the comm stream the send
-  runs on rather than the schedule stream, and it sets
-  send_proxy_requires_forward_fence, which the commit at the top of the loop
-  reads and clears. Without that, a CUDA-graph decode would replay while NCCL
-  still read the previous step's proxy tensors (views of replay-owned static
-  buffers).
-- environ: the three switches added next to the current PP/topk blocks, and
-  the bucket default widened to 8192,16384,32768,65536,131072.
-- The opt4 regression test is registered for CPU CI and its stubs updated for
-  the current loop (ingest_requests, mb_metadata, the fence kwarg).
-
-Verified: fp16_mqa_logits_triton matches a float64 reference to 6.7e-4 max
-relative error with masking and tail-zeroing correct; both
-scheduler_pp_mixin order tests pass; ruff format/check, isort, py_compile and
-the registered-test lint are clean.
----
- .../ops/attention/dsa/triton_mqa_logits.py    | 220 +++++++++---------
- .../kernels/ops/attention/dsv4/__init__.py    |   2 +
- .../sglang/kernels/ops/attention/dsv4/topk.py | 122 ++++++++++
- .../kernels/ops/elementwise/elementwise.py    | 121 ++++++++--
- .../kernels/ops/quantization/fp8_w8a16.py     |  23 +-
- .../srt/entrypoints/openai/serving_chat.py    |  77 +++++-
- python/sglang/srt/environ.py                  |   8 +-
- .../srt/layers/attention/dsv4/indexer.py      |  48 +++-
- .../sglang/srt/managers/scheduler_pp_mixin.py |  27 ++-
- python/sglang/srt/models/deepseek_v4.py       |  21 +-
- .../unit/managers/test_scheduler_pp_mixin.py  | 126 ++++++++++
- 11 files changed, 644 insertions(+), 151 deletions(-)
- create mode 100644 test/registered/unit/managers/test_scheduler_pp_mixin.py
-
-diff --git a/python/sglang/kernels/ops/attention/dsa/triton_mqa_logits.py b/python/sglang/kernels/ops/attention/dsa/triton_mqa_logits.py
-index ac05ceeae2..76a669aa98 100644
---- a/python/sglang/kernels/ops/attention/dsa/triton_mqa_logits.py
-+++ b/python/sglang/kernels/ops/attention/dsa/triton_mqa_logits.py
-@@ -1,102 +1,87 @@
--"""Triton FP8 MQA logits for the DSA indexer on GPUs without FP8 tensor cores.
-+"""FP8 MQA logits for the DSA indexer on GPUs without FP8 tensor cores.
- 
--Replaces ``deep_gemm.fp8_mqa_logits`` on sub-90 (SM75/SM80). SM75 Triton has
--no e4m3 cast, so q/k are dequantized to fp16 with torch elementwise ops first
--(cheap: q is [Q, H, 128], k is [K, 128]); the kernel then runs the fp16 tensor
--cores (Turing mma.sync) with the DeepGEMM semantics:
-+Replaces ``deep_gemm.fp8_mqa_logits`` on sub-90 (SM75/SM80) with the DeepGEMM
-+semantics:
- 
-     logits[q, j] = sum_h weights[q, h] * relu(dot(q[q, h], k[j])) * k_scale[j]
-                    for ks[q] <= j < ke[q], else 0.
- 
--SMEM budget: SM75 has 64 KB. The real indexer shape is H=64 heads x D=128, so
--loading all heads of a q-row block at once (BLOCK_Q*H*D*2 = 128 KB) does not
--fit; the head dimension is tiled (BLOCK_H) and accumulated in registers.
--
--  q:     [Q, H, D] fp16
--  k:     [K, D]    fp16
--  k_scale: [K]     fp32
--  weights: [Q, H]  fp32
--  ks, ke:  [Q]     int32
--  out:     [Q, max_seqlen_k] fp32
-+The Triton ``tl.dot`` path was measured at ~1.5 TFLOP-equivalent on SM75:
-+this Triton build lowers every fp16 dot (even a vanilla matmul) to scalar
-+FFMA instead of mma.sync, and a cross-warp head reduce inside the key loop
-+adds a serialized shared-memory round-trip on top. cuBLAS fp16 tensor-core
-+GEMMs are ~30x faster, so the fallback is a key-chunked GEMM + epilogue:
++    def _quantize_lm_head_fp8(self) -> None:
++        """Store the LM head as block-scaled e4m3 and free the bf16 copy.
 +
-+  1. dequantize q/k to fp16 once (fp8->fp16 elementwise, negligible),
-+  2. per key chunk: s = q2d @ k_chunk^T on tensor cores ([Q*H, C]),
-+  3. relu, then a strided-batched fp16 GEMM contracts the head axis against
-+     weights ([Q, 1, H] x [Q, H, C]),
-+  4. scale by k_scale and mask to [ks, ke) (outside the range reads as 0,
-+     matching the reference the topk transform consumes).
-+
-+Chunking bounds the [Q*H, C] score tile; at C=1024 it is Q*2 KB fp16.
-+
-+fp16 range: both GEMMs above land in fp16, so the operands have to be
-+pre-scaled. The indexer quantizes every q and k row with absmax scaling
-+(``scale = absmax / FP8_E4M3_MAX`` in the fused rope+hadamard+quant kernel),
-+so a dequantized row reaches 448 and a D=128 dot of two such rows reaches
-+``D * 448 * 448 = 2.6e7`` -- fp16 tops out at 65504, and an unscaled GEMM
-+saturates every real logit tile to inf, which turns the top-k into an
-+arbitrary prefix of the page range. ``_plan_scales`` divides a power of two
-+out first (exact in fp16, and relu is positively homogeneous so it commutes
-+with the scale) and the inverse goes back in fp32. Accuracy left over is the
-+fp16 pipeline's ~5e-4 relative, which is better than the bf16 torch fallback
-+upstream uses on the same hardware.
- """
- 
-+import math
-+
- import torch
--import triton
--import triton.language as tl
--
--
--@triton.jit
--def _fp16_mqa_logits_kernel(
--    q_ptr,  # [Q, H, D] fp16
--    k_ptr,  # [K, D] fp16
--    ks_ptr,  # [K] fp32 (k scales)
--    w_ptr,  # [Q, H] fp32
--    ks_idx_ptr,  # [Q] int32
--    ke_idx_ptr,  # [Q] int32
--    out_ptr,  # [Q, N] fp32
--    Q,
--    N,
--    H: tl.constexpr,
--    D: tl.constexpr,
--    BLOCK_Q: tl.constexpr,
--    BLOCK_K: tl.constexpr,
--    BLOCK_H: tl.constexpr,
--):
--    pid = tl.program_id(0)
--    offs_q = pid * BLOCK_Q + tl.arange(0, BLOCK_Q)
--    q_mask = offs_q < Q
--
--    ks = tl.load(ks_idx_ptr + offs_q, mask=q_mask, other=0)
--    ke = tl.load(ke_idx_ptr + offs_q, mask=q_mask, other=0)
--    k_max = tl.max(ke, axis=0)
--
--    offs_k = tl.arange(0, BLOCK_K)
--    offs_bh = tl.arange(0, BLOCK_H)
--    offs_d = tl.arange(0, D)
--    num_h_tiles = H // BLOCK_H
--
--    for k0 in range(0, k_max, BLOCK_K):
--        g_k = k0 + offs_k
--        k_mask = g_k < k_max
--        k_v = tl.load(
--            k_ptr + g_k[:, None] * D + offs_d[None, :],
--            mask=k_mask[:, None],
--            other=0.0,
--        )  # [BLOCK_K, D]
--
--        acc = tl.zeros((BLOCK_Q, BLOCK_K), tl.float32)
--        for ht in range(0, num_h_tiles):
--            offs_h = ht * BLOCK_H + offs_bh
--            # q tile: [BLOCK_Q, BLOCK_H, D] -> [BLOCK_Q*BLOCK_H, D]
--            q_off = (
--                offs_q[:, None, None] * (H * D)
--                + offs_h[None, :, None] * D
--                + offs_d[None, None, :]
--            )
--            q_v = tl.load(q_ptr + q_off, mask=q_mask[:, None, None], other=0.0)
--            q_v = tl.reshape(q_v, (BLOCK_Q * BLOCK_H, D))
--
--            s = tl.dot(q_v, tl.trans(k_v), out_dtype=tl.float32)  # [BQ*BH, BK]
--            s = tl.maximum(s, 0.0)  # relu
--            s = tl.reshape(s, (BLOCK_Q, BLOCK_H, BLOCK_K))
--            w = tl.load(
--                w_ptr + offs_q[:, None] * H + offs_h[None, :],
--                mask=q_mask[:, None],
--                other=0.0,
--            )  # [BLOCK_Q, BLOCK_H]
--            acc += tl.sum(s * w[:, :, None], axis=1)  # [BLOCK_Q, BLOCK_K]
--
--        k_scale = tl.load(ks_ptr + g_k, mask=k_mask, other=0.0)
--        acc = acc * k_scale[None, :]
--
--        valid = (g_k[None, :] >= ks[:, None]) & (g_k[None, :] < ke[:, None])
--        acc = tl.where(valid, acc, 0.0)
--
--        tl.store(
--            out_ptr + offs_q[:, None] * N + g_k[None, :],
--            acc,
--            mask=q_mask[:, None] & k_mask[None, :],
--        )
-+
-+_CHUNK = 1024
-+
-+# Comfortably below fp16 max (65504). The scales are exact powers of two, so
-+# this only has to cover the slack left by the log2 rounding in _pow2_floor.
-+_FP16_HEADROOM = 30000.0
-+
-+
-+def _pow2_floor(values: float) -> float:
-+    """Largest power of two <= ``values`` (positive)."""
-+    return math.ldexp(1.0, math.floor(math.log2(values)) - 1)
-+
-+
-+def _plan_scales(
-+    q_dtype: torch.dtype,
-+    D: int,
-+    H: int,
-+    weights: torch.Tensor,
-+) -> tuple[float, torch.Tensor, torch.Tensor]:
-+    """Pick the fp16 range plan for the two GEMMs.
-+
-+    Returns ``(q_scale, w_scale, inv)``. ``q_scale`` is a Python float applied
-+    to q before the dot GEMM; ``w_scale`` is a 0-dim tensor folded into the
-+    weights before the head contraction; ``inv`` undoes both in fp32.
-+    """
-+    # The dot bound only needs the fp8 dynamic range, not the data: both
-+    # operands are absmax-quantized, so |q| , |k| <= FP8_E4M3_MAX always. A
-+    # compile-time bound is both cheaper than a reduction and strictly safer
-+    # than a data-dependent one.
-+    fp8_max = float(torch.finfo(q_dtype).max)
-+    q_scale = _pow2_floor(_FP16_HEADROOM / (D * fp8_max * fp8_max))
-+
-+    # The head contraction is a sum of H weighted terms, so it needs its own
-+    # budget: H * w_absmax * w_scale * dot must fit, and dot is bounded by the
-+    # headroom above. Capped at 1 -- with small weights the headroom is
-+    # already there and scaling up could overflow w * w_scale on its own.
-+    w_absmax = weights.abs().amax().float().clamp(min=torch.finfo(torch.float32).tiny)
-+    w_scale = torch.exp2(
-+        torch.clamp(torch.floor(torch.log2(1.0 / (H * w_absmax))) - 1.0, max=0.0)
-+    )
-+
-+    # The fp16 result carries one factor of q_scale (scaling q scales the dot
-+    # linearly) and one of w_scale.
-+    inv = 1.0 / (q_scale * w_scale)
-+    return q_scale, w_scale, inv
- 
- 
- def fp16_mqa_logits_triton(
-@@ -107,30 +92,37 @@ def fp16_mqa_logits_triton(
-     ks: torch.Tensor,  # [Q] int32
-     ke: torch.Tensor,  # [Q] int32
-     out: torch.Tensor,  # [Q, N] float32
--    block_q: int = 8,
--    block_k: int = 64,
--    block_h: int = 8,
-+    chunk: int = _CHUNK,
- ) -> torch.Tensor:
-     Q, H, D = q_fp8.shape
--    q16 = q_fp8.to(torch.float16)
-+    N = out.shape[1]
-+    K = k_fp8.shape[0]
-     k16 = k_fp8.to(torch.float16)
--    grid = (triton.cdiv(Q, block_q),)
--    _fp16_mqa_logits_kernel[grid](
--        q16,
--        k16,
--        k_scale,
--        weights,
--        ks,
--        ke,
--        out,
--        Q,
--        out.shape[1],
--        H=H,
--        D=D,
--        BLOCK_Q=block_q,
--        BLOCK_K=block_k,
--        BLOCK_H=block_h,
--        num_warps=4,
--        num_stages=1,
--    )
-+    q16 = q_fp8.reshape(Q, H, D).to(torch.float16)
-+
-+    q_scale, w_scale, inv = _plan_scales(q_fp8.dtype, D, H, weights)
-+    if q_scale != 1.0:
-+        q16 = (q16 * q_scale).reshape(Q * H, D)
-+    w16 = (weights * w_scale).to(torch.float16).unsqueeze(1)  # [Q, 1, H]
-+    inv = inv.to(torch.float32)
-+    ks_i = ks.to(torch.int64).unsqueeze(1)
-+    ke_i = ke.to(torch.int64).unsqueeze(1)
-+
-+    # k_fp8 holds the gathered compressed keys and can be shorter than N,
-+    # which is page-rounded (max_seqlen_k); only the real keys carry logits.
-+    n_scored = min(N, K)
-+    for c0 in range(0, n_scored, chunk):
-+        c1 = min(c0 + chunk, n_scored)
-+        s = torch.mm(q16, k16[c0:c1].t())  # [Q*H, C] fp16, tensor cores
-+        s.relu_()
-+        acc = torch.bmm(w16, s.view(Q, H, c1 - c0)).float()  # [Q, 1, C]
-+        acc = acc.squeeze(1) * inv * k_scale[c0:c1].unsqueeze(0)
-+        cols = torch.arange(c0, c1, device=out.device, dtype=torch.int64)
-+        acc.masked_fill_((cols < ks_i) | (cols >= ke_i), 0.0)
-+        out[:, c0:c1] = acc
-+    if n_scored < N:
-+        # The tail is page padding with no key behind it. Callers allocate the
-+        # logits with new_empty, so leaving it undefined would hand the top-k
-+        # whatever the allocator last left in that block.
-+        out[:, n_scored:].zero_()
-     return out
-diff --git a/python/sglang/kernels/ops/attention/dsv4/__init__.py b/python/sglang/kernels/ops/attention/dsv4/__init__.py
-index a92f72bb1a..d36c8c8f2b 100644
---- a/python/sglang/kernels/ops/attention/dsv4/__init__.py
-+++ b/python/sglang/kernels/ops/attention/dsv4/__init__.py
-@@ -26,6 +26,7 @@ from .fp8_wo_a import sglang_per_token_group_quant_fp8_dsv4_wo_a
- from .topk import (
-     plan_topk_v2,
-     topk_transform_paged,
-+    topk_transform_paged_triton,
-     topk_transform_paged_v2,
-     topk_transform_ragged_v2,
- )
-@@ -50,6 +51,7 @@ __all__ = [
-     "get_paged_mqa_logits_metadata",
-     "triton_create_paged_compress_data",
-     "topk_transform_paged",
-+    "topk_transform_paged_triton",
-     "topk_transform_paged_v2",
-     "topk_transform_ragged_v2",
-     "plan_topk_v2",
-diff --git a/python/sglang/kernels/ops/attention/dsv4/topk.py b/python/sglang/kernels/ops/attention/dsv4/topk.py
-index a68cb99bb9..802e1a9e06 100644
---- a/python/sglang/kernels/ops/attention/dsv4/topk.py
-+++ b/python/sglang/kernels/ops/attention/dsv4/topk.py
-@@ -3,6 +3,8 @@ from __future__ import annotations
- from typing import Optional
- 
- import torch
-+import triton
-+import triton.language as tl
- 
- from sglang.kernels.jit.utils import (
-     cache_once,
-@@ -101,6 +103,126 @@ def topk_transform_bf16_small(
-     )
- 
- 
-+@triton.jit
-+def _topk_transform_paged_triton_kernel(
-+    scores_ptr,
-+    seq_lens_ptr,
-+    page_tables_ptr,
-+    out_page_indices_ptr,
-+    out_raw_indices_ptr,
-+    max_seq_len,
-+    stride_scores,
-+    page_table_width,
-+    stride_page_tables,
-+    K: tl.constexpr,
-+    K_POW2: tl.constexpr,
-+    BLOCK_N: tl.constexpr,
-+    PAGE_SIZE: tl.constexpr,
-+    WRITE_RAW: tl.constexpr,
-+):
-+    row = tl.program_id(0)
-+    seq_len = tl.load(seq_lens_ptr + row)
-+    offs_n = tl.arange(0, BLOCK_N)
-+    acc = tl.zeros((K_POW2,), dtype=tl.uint64)
-+    for start in range(0, seq_len, BLOCK_N):
-+        cols = start + offs_n
-+        valid = cols < seq_len
-+        score = tl.load(
-+            scores_ptr + row * stride_scores + cols,
-+            mask=valid,
-+            other=float("-inf"),
++        The checkpoint ships head.weight bf16, so each decode step on the last
++        PP stage streams 530 MB of weight per row at TP2, which a cuBLAS gemv
++        already runs at the card's read ceiling. Halving the bytes is the only
++        way faster. Quantization is the same 128x128-block recipe the dense
++        layers use, done on CPU so the GPU never needs the fp32 scratch.
++        """
++        lm_head = self.lm_head
++        weight = getattr(lm_head, "weight", None)
++        if weight is None or getattr(lm_head, "weight_fp8", None) is not None:
++            return
++        n, k = weight.shape
++        if n % 128 or k % 128:
++            logger.warning(
++                "lm_head shard %s is not a multiple of the 128 block scale; "
++                "keeping the bf16 head",
++                (n, k),
++            )
++            return
++        blocks = weight.detach().float().cpu().view(n // 128, 128, k // 128, 128)
++        amax = blocks.abs().amax(dim=(1, 3), keepdim=True).clamp_(min=1e-4)
++        scale = amax / 448.0
++        wq = ((blocks / scale).to(torch.float8_e4m3fn)).view(n, k)
++        lm_head.register_buffer(
++            "weight_fp8", wq.to(weight.device), persistent=False
 +        )
-+        score_bits = score.to(tl.uint32, bitcast=True)
-+        sign = tl.full(score_bits.shape, 0x80000000, tl.uint32)
-+        key = tl.where(
-+            (score_bits & sign) != 0,
-+            ~score_bits,
-+            score_bits ^ sign,
++        lm_head.register_buffer(
++            "weight_scale_inv",
++            scale.view(n // 128, k // 128).to(device=weight.device),
++            persistent=False,
 +        )
-+        packed = (key.to(tl.uint64) << 32) | cols.to(tl.uint64)
-+        candidate = tl.topk(packed, K_POW2, dim=0)
-+        acc = tl.bitonic_merge(acc)
-+        acc = tl.maximum(acc, tl.topk(candidate, K_POW2, dim=0))
-+    acc = tl.sort(acc, descending=True)
-+    offs_k = tl.arange(0, K_POW2)
-+    raw = (acc & 0xFFFFFFFF).to(tl.int32)
-+    valid = (offs_k < K) & (offs_k < seq_len)
-+    page_ids = raw // PAGE_SIZE
-+    page_ids = tl.where(valid, page_ids, 0)
-+    pages = tl.load(
-+        page_tables_ptr + row * stride_page_tables + page_ids,
-+        mask=valid,
-+        other=0,
-+    )
-+    page_indices = pages * PAGE_SIZE + raw % PAGE_SIZE
-+    page_indices = tl.where(valid, page_indices, -1).to(tl.int32)
-+    tl.store(
-+        out_page_indices_ptr + row * K + offs_k,
-+        page_indices,
-+        mask=offs_k < K,
-+    )
-+    if WRITE_RAW:
-+        raw = tl.where(valid, raw, -1)
-+        tl.store(
-+            out_raw_indices_ptr + row * K + offs_k,
-+            raw,
-+            mask=offs_k < K,
-+        )
-+
-+
-+def topk_transform_paged_triton(
-+    scores: torch.Tensor,
-+    seq_lens: torch.Tensor,
-+    page_tables: torch.Tensor,
-+    out_page_indices: torch.Tensor,
-+    page_size: int,
-+    out_raw_indices: Optional[torch.Tensor] = None,
-+) -> None:
-+    assert scores.ndim == 2
-+    assert scores.dtype == torch.float32
-+    assert scores.stride(1) == 1
-+    assert scores.stride(0) > 0
-+    assert seq_lens.ndim == 1 and seq_lens.shape[0] == scores.shape[0]
-+    assert page_tables.ndim == 2 and page_tables.shape[0] == scores.shape[0]
-+    assert page_tables.stride(1) == 1
-+    assert out_page_indices.ndim == 2
-+    assert out_page_indices.shape[0] == scores.shape[0]
-+    assert out_page_indices.dtype == torch.int32
-+    K = out_page_indices.shape[1]
-+    K_POW2 = triton.next_power_of_2(K)
-+    assert 0 < K <= 1024
-+    assert page_size > 0
-+    assert page_size & (page_size - 1) == 0
-+    if out_raw_indices is None:
-+        raw_indices = out_page_indices
-+        write_raw = False
-+    else:
-+        raw_indices = out_raw_indices
-+        assert raw_indices.shape == out_page_indices.shape
-+        assert raw_indices.dtype == torch.int32
-+        write_raw = True
-+    BLOCK_N = max(256, min(K_POW2, 1024))
-+    grid = (scores.shape[0],)
-+    _topk_transform_paged_triton_kernel[grid](
-+        scores,
-+        seq_lens,
-+        page_tables,
-+        out_page_indices,
-+        raw_indices,
-+        scores.shape[1],
-+        scores.stride(0),
-+        page_tables.shape[1],
-+        page_tables.stride(0),
-+        K=K,
-+        K_POW2=K_POW2,
-+        BLOCK_N=BLOCK_N,
-+        PAGE_SIZE=page_size,
-+        WRITE_RAW=write_raw,
-+        num_warps=4,
-+        num_stages=1,
-+    )
-+
-+
- def topk_transform_paged(
-     scores: torch.Tensor,
-     seq_lens: torch.Tensor,
-diff --git a/python/sglang/kernels/ops/elementwise/elementwise.py b/python/sglang/kernels/ops/elementwise/elementwise.py
-index 929a9b3616..82716d138c 100644
---- a/python/sglang/kernels/ops/elementwise/elementwise.py
-+++ b/python/sglang/kernels/ops/elementwise/elementwise.py
-@@ -674,6 +674,8 @@ def _moe_combine_kernel(
-     SCALE,
-     HAS_SCALE: tl.constexpr,
-     BLOCK: tl.constexpr,
-+    USE_SLOT_MAP: tl.constexpr,
-+    slot_map_ptr,  # [num_tokens, TOPK] int32, slot of each (token, k), or -1
- ):
-     """Weighted sum over topk of the routed-expert outputs, in one kernel.
- 
-@@ -682,29 +684,43 @@ def _moe_combine_kernel(
-     whole thing to fp32, multiplies by the routing weights and reduces over topk. That
-     is 13 kernels and 30.6 us of device time at the decode shape against a ~1 us floor.
- 
--    Each program owns one (token, hidden block) and walks the padded slots, accumulating
--    the rows whose owner is this token. The test is on a scalar, so a non-matching slot
--    costs one compare and no load, and the traffic is exactly topk rows per token.
--    num_valid is read from the device rather than passed as a value so the launch stays
--    capturable in a CUDA graph.
--
-     Accumulation is fp32 with one cast at the end, matching the torch order: fp32
-     multiply, fp32 sum over topk, then cast to the output dtype.
-+
-+    Two ways to find a token's rows, because the right one depends on the shape:
-+
-+    USE_SLOT_MAP=True walks a precomputed [num_tokens, TOPK] table of slot ids, so
-+    the inner loop is exactly TOPK iterations. USE_SLOT_MAP=False keeps the original
-+    scan of every padded slot, testing the owner scalar. The scan is fine at decode
-+    (a handful of slots) but quadratic-ish at prefill: with 512 tokens x topk 6 the
-+    padding runs to ~3072 slots and there are 4096 programs, so it issues ~12.6M
-+    scalar owner loads to deliver 24576 row-block loads. The table turns that into
-+    6 iterations per program and was measured at prefill shape on a 2080 Ti, where
-+    this kernel was 2.7 ms/call -- 9.4% of PP3's device time.
-     """
-     tok = tl.program_id(0)
-     offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
--    num_valid = tl.load(num_valid_ptr)
--    lo = tok * TOPK
--    hi = lo + TOPK
-     acc = tl.zeros([BLOCK], dtype=tl.float32)
--    for s in range(0, num_slots):
--        owner = tl.load(sorted_ptr + s)
--        # Invalid means the pad sentinel or a position at or past num_valid, where
--        # sorted_ids is uninitialised and would otherwise index outside the output.
--        if (owner >= lo) & (owner < hi) & (s < num_valid):
--            w = tl.load(weight_ptr + owner)
--            v = tl.load(down_ptr + s.to(tl.int64) * down_stride + offs)
--            acc += w * v.to(tl.float32)
-+
-+    if USE_SLOT_MAP:
-+        for k in tl.static_range(TOPK):
-+            s = tl.load(slot_map_ptr + tok * TOPK + k)
-+            if s >= 0:
-+                w = tl.load(weight_ptr + tok * TOPK + k)
-+                v = tl.load(down_ptr + s.to(tl.int64) * down_stride + offs)
-+                acc += w * v.to(tl.float32)
-+    else:
-+        num_valid = tl.load(num_valid_ptr)
-+        lo = tok * TOPK
-+        hi = lo + TOPK
-+        for s in range(0, num_slots):
-+            owner = tl.load(sorted_ptr + s)
-+            # Invalid means the pad sentinel or a position at or past num_valid, where
-+            # sorted_ids is uninitialised and would otherwise index outside the output.
-+            if (owner >= lo) & (owner < hi) & (s < num_valid):
-+                w = tl.load(weight_ptr + owner)
-+                v = tl.load(down_ptr + s.to(tl.int64) * down_stride + offs)
-+                acc += w * v.to(tl.float32)
-     if HAS_SCALE:
-         acc = acc * SCALE
-     tl.store(
-@@ -712,6 +728,41 @@ def _moe_combine_kernel(
-     )
- 
- 
-+@triton.jit
-+def _moe_slot_map_scatter_kernel(
-+    sorted_ptr,  # [num_slots] int32 owner = t*topk + k, or the pad sentinel
-+    num_valid_ptr,  # [1] int32
-+    map_ptr,  # [num_tokens*TOPK] int32, -1 where the pair has no live slot
-+    num_slots,
-+    NUM_PAIRS,  # num_tokens * topk
-+    TOPK: tl.constexpr,
-+    BLOCK: tl.constexpr,
-+):
-+    """map[t*topk + k] = the slot whose owner is t*topk + k, or -1.
-+
-+    Scatter, not scan. One program per (owner, slot-block): it reads BLOCK owners,
-+    and for each one stores its own position into map[owner]. Every slot is visited
-+    exactly once, so this is O(num_slots) total work instead of the
-+    O(num_slots * num_tokens * topk) a per-pair scan would do.
-+
-+    The map is pre-filled with -1 by the caller, so a pair with no live slot (its
-+    experts were all filtered out) keeps -1 and the combine kernel skips it. Writing
-+    -1 from here too would race: a later slot for the same owner would not be able to
-+    tell it had already been written.
-+
-+    Graph-safe: no nonzero(), no host sync; num_valid is read on the device.
-+    """
-+    pid = tl.program_id(0)
-+    offs = pid * BLOCK + tl.arange(0, BLOCK)
-+    mask = offs < num_slots
-+    owner = tl.load(sorted_ptr + offs, mask=mask, other=-1)
-+    num_valid = tl.load(num_valid_ptr)
-+    # Drop the pad sentinel and anything at or past num_valid, where sorted_ids is
-+    # uninitialised and could index outside the map.
-+    ok = mask & (owner >= 0) & (owner < NUM_PAIRS) & (offs < num_valid)
-+    tl.store(map_ptr + owner, offs.to(tl.int32), mask=ok)
-+
-+
- def moe_combine(
-     down_slots: torch.Tensor,
-     sorted_ids: torch.Tensor,
-@@ -721,6 +772,7 @@ def moe_combine(
-     topk: int,
-     scale=None,
-     out: torch.Tensor = None,
-+    use_slot_map: bool = None,
- ):
-     """out[t] = sum over the topk slots owned by t of weight * down_slots[slot].
- 
-@@ -751,6 +803,39 @@ def moe_combine(
-         BLOCK = next(
-             (b for b in (256, 128, 64, 32, 16, 8, 4, 2, 1) if hidden % b == 0), 1
-         )
-+    # The slot table costs a fixed ~0.13 ms (a fill_ plus a scatter over num_slots)
-+    # and turns the inner loop from num_slots to topk. It only pays once the scan is
-+    # long enough to dwarf that: measured on a 2080 Ti at H=2048, topk=6,
-+    #   B=128 slots=1024 -> scan 0.106 ms, table 0.222 ms  (0.48x, keep the scan)
-+    # B=256 slots=1792 -> scan 0.251 ms, table 0.221 ms  (1.13x, break even)
-+    #   B=512 slots=3072 -> scan 0.660 ms, table 0.232 ms  (2.85x)
-+    #   B=512 slots=4096 -> scan 0.853 ms, table 0.222 ms  (3.84x)
-+    # The crossover sits near B=256, i.e. where num_slots >= ~28x topk. The
-+    # num_tokens floor keeps small batches out even when the padding ratio is high:
-+    # at B=8 a padded num_slots can clear 28x topk while the whole combine is only
-+    # tens of microseconds, so the table's fixed cost would dominate. Decode
-+    # (B=1, num_slots ~ 8x topk) stays on the scan, which is what it wants.
-+    if use_slot_map is None:
-+        use_slot_map = num_tokens >= 256 and num_slots >= 28 * topk
-+    slot_map = None
-+    if use_slot_map:
-+        npairs = num_tokens * topk
-+        # Filled with -1 first so pairs with no live slot stay -1; the scatter then
-+        # writes the real slot ids. fill_ is a device op, so this stays graph-safe.
-+        slot_map = torch.full(
-+            (npairs,), -1, dtype=torch.int32, device=down_slots.device
-+        )
-+        SBLOCK = 256
-+        _moe_slot_map_scatter_kernel[(triton.cdiv(num_slots, SBLOCK),)](
-+            sorted_ids,
-+            num_valid,
-+            slot_map,
-+            num_slots,
-+            npairs,
-+            TOPK=topk,
-+            BLOCK=SBLOCK,
-+            num_warps=4,
-+        )
-     _moe_combine_kernel[(num_tokens, hidden // BLOCK)](
-         down_slots,
-         sorted_ids,
-@@ -764,6 +849,8 @@ def moe_combine(
-         SCALE=1.0 if scale is None else float(scale),
-         HAS_SCALE=scale is not None,
-         BLOCK=BLOCK,
-+        USE_SLOT_MAP=use_slot_map,
-+        slot_map_ptr=slot_map if slot_map is not None else sorted_ids,
-         num_warps=2 if BLOCK <= 512 else 4,
-     )
-     return out
-diff --git a/python/sglang/kernels/ops/quantization/fp8_w8a16.py b/python/sglang/kernels/ops/quantization/fp8_w8a16.py
-index 43c8827ba0..90fbda0625 100644
---- a/python/sglang/kernels/ops/quantization/fp8_w8a16.py
-+++ b/python/sglang/kernels/ops/quantization/fp8_w8a16.py
-@@ -51,6 +51,8 @@ import torch
- import triton
- import triton.language as tl
- 
-+from sglang.srt.environ import envs
-+
- BLOCK_SCALE = 128
- 
- # Above this many activation rows the projection stops being bandwidth bound and
-@@ -216,6 +218,17 @@ _WIDE_MIN_K = 2048
- _WIDE_MAX_GRID = 2048
- 
- 
-+def _should_use_w8a16_wide(
-+    rows: int, n: int, k: int, allow_k1024: bool = False
-+) -> bool:
-+    return (
-+        _W8A16_WIDE
-+        and rows <= 2
-+        and (k >= _WIDE_MIN_K or (allow_k1024 and k == 1024))
-+        and triton.cdiv(n, 4) <= _WIDE_MAX_GRID
-+    )
-+
-+
- @triton.jit
- def _w8a16_gemv_wide_kernel(
-     x_ptr,
-@@ -493,11 +506,11 @@ def _w8a16_linear_impl(
-         # Two divisibility requirements the narrow kernel does not have: block_k must
-         # divide k, because these loads are unmasked, and block_n must divide the
-         # 128-row scale group, because the scale is indexed by a single group per tile.
--        if (
--            _W8A16_WIDE
--            and m <= 2
--            and k >= _WIDE_MIN_K
--            and triton.cdiv(n, 4) <= _WIDE_MAX_GRID
-+        if _should_use_w8a16_wide(
-+            m,
++        del lm_head.weight
++        logger.info(
++            "lm_head quantized to fp8 (shard %dx%d): decode reads %d MB/tok "
++            "instead of %d MB/tok",
 +            n,
 +            k,
-+            allow_k1024=envs.SGLANG_OPT_W8A16_WIDE_M1_K1024.get(),
-         ):
-             # See _WIDE_MIN_K / _WIDE_MAX_GRID for where these two numbers come from.
-             block_k = 2048
-diff --git a/python/sglang/srt/entrypoints/openai/serving_chat.py b/python/sglang/srt/entrypoints/openai/serving_chat.py
-index 6845aa4936..e096064883 100644
---- a/python/sglang/srt/entrypoints/openai/serving_chat.py
-+++ b/python/sglang/srt/entrypoints/openai/serving_chat.py
-@@ -4,6 +4,7 @@ import copy
- import json
- import logging
- import math
-+import os
- import time
- import uuid
- from collections import OrderedDict
-@@ -265,6 +266,69 @@ def _build_video_config(request: ChatCompletionRequest) -> dict[str, Any] | None
-     return config or None
- 
- 
-+# Sampling parameters a deployment can pin for clients that send none.
-+# See _sampling_params_override_from_env.
-+_SAMPLING_PARAM_NAMES = (
-+    "temperature",
-+    "top_p",
-+    "top_k",
-+    "min_p",
-+    "repetition_penalty",
-+)
-+
-+
-+def _sampling_params_override_from_env(
-+    model_defaults: Dict[str, Any],
-+) -> Dict[str, Any]:
-+    """Deployment override for the default sampling parameters.
-+
-+    A request that omits the sampling parameters falls back to the checkpoint's
-+    ``generation_config.json`` (or, with ``--sampling-defaults openai``, to
-+    sglang's own defaults). Both of those are ``temperature=1.0, top_p=1.0``,
-+    which is a fine placeholder for "unspecified" and unusable for anything
-+    that has to emit structured text: tool-call arguments run to thousands of
-+    tokens, and unrestricted sampling over that many steps reliably injects
-+    stray tokens into the JSON the caller has to parse. Measured on this box with
-+    a 2472-character verbatim-copy prompt: similarity to the target 0.9998 at
-+    ``temperature=0`` versus 0.36 at ``temperature=1.0``.
-+
-+    ``SGLANG_DEFAULT_SAMPLING_PARAMS`` takes a JSON object over the same names,
-+    e.g. ``{"temperature": 0.6, "top_p": 0.95}``. It lands in the same dict as
-+    the model generation config, so the precedence stays
-+    request value > this override > model generation config > sglang default:
-+    a client that sets ``temperature`` itself is never overridden. Unset (the
-+    default) changes nothing.
-+    """
-+    raw = os.environ.get("SGLANG_DEFAULT_SAMPLING_PARAMS", "").strip()
-+    if not raw:
-+        return {}
-+    try:
-+        parsed = json.loads(raw)
-+    except json.JSONDecodeError as exc:
-+        raise ValueError(
-+            f"SGLANG_DEFAULT_SAMPLING_PARAMS is not valid JSON: {exc}"
-+        ) from exc
-+    if not isinstance(parsed, dict):
-+        raise ValueError(
-+            "SGLANG_DEFAULT_SAMPLING_PARAMS must be a JSON object, got "
-+            f"{type(parsed).__name__}"
++            n * k // 2**20,
++            2 * n * k // 2**20,
 +        )
-+    unknown = set(parsed) - set(_SAMPLING_PARAM_NAMES)
-+    if unknown:
-+        raise ValueError(
-+            f"SGLANG_DEFAULT_SAMPLING_PARAMS has unknown key(s) {sorted(unknown)}; "
-+            f"supported: {list(_SAMPLING_PARAM_NAMES)}"
-+        )
-+    if parsed != model_defaults:
-+        logger.warning(
-+            "Overriding default chat sampling params %s with %s from "
-+            "SGLANG_DEFAULT_SAMPLING_PARAMS",
-+            model_defaults or "{}",
-+            parsed,
-+        )
-+    return parsed
 +
-+
- class OpenAIServingChat(OpenAIServingBase):
-     """Handler for /v1/chat/completions requests"""
- 
-@@ -303,12 +367,15 @@ class OpenAIServingChat(OpenAIServingBase):
-         self.default_sampling_params = (
-             self.tokenizer_manager.model_config.get_default_sampling_params()
-         )
-+        self.default_sampling_params.update(
-+            _sampling_params_override_from_env(self.default_sampling_params)
-+        )
-         if (
-             self.default_sampling_params
-             and not OpenAIServingChat._default_sampling_params_logged
-         ):
-             logger.info(
--                f"Using default chat sampling params from model generation config: {self.default_sampling_params}",
-+                f"Using default chat sampling params: {self.default_sampling_params}",
-             )
-             OpenAIServingChat._default_sampling_params_logged = True
- 
-@@ -1583,6 +1650,14 @@ class OpenAIServingChat(OpenAIServingBase):
-                     thinking_mode=thinking_mode,
-                     reasoning_effort=v4_reasoning_effort,
-                     reasoning_effort_profile=reasoning_effort_profile,
-+                    # A leading <|begin_of_sentence|> is not what this
-+                    # checkpoint was trained to start a chat with: with it,
-+                    # greedy decoding emits the BOS token again and keeps
-+                    # doing so for the whole budget (measured 2026-09-28 on the
-+                    # sub-80 build, short chat turns and 6K-token prompts
-+                    # alike). The tokenizer itself adds no BOS
-+                    # (add_bos_token is false), so nothing else supplies one.
-+                    add_default_bos_token=False,
-                 )
-                 prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
-             elif is_dsv41:
-diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
-index f1074b3776..f26210e2b9 100644
---- a/python/sglang/srt/environ.py
-+++ b/python/sglang/srt/environ.py
-@@ -663,6 +663,10 @@ class Envs:
-     # Run PP tensor communication on a dedicated stream so asynchronous sends
-     # do not fence the next forward through the scheduler stream.
-     SGLANG_PP_COMM_OVERLAP = EnvBool(False)
-+    # PP: start the proxy-dict send for the current micro-batch before the
-+    # result post-processing below, so the send overlaps the host-side work
-+    # instead of following it. See SchedulerPPMixin.
-+    SGLANG_PP_EARLY_PROXY_SEND = EnvBool(False)
-     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
- 
-     # ===================================================================
-@@ -1173,7 +1177,7 @@ class Envs:
-     # only ever be too narrow, which the existing
-     # `assert actual_max_seq_len <= chosen_max_seq_len` turns into a crash rather
-     # than silently dropped context. Set empty to disable (one graph per batch size).
--    SGLANG_DSV4_DECODE_SEQ_LEN_BUCKETS = EnvStr("8192")
-+    SGLANG_DSV4_DECODE_SEQ_LEN_BUCKETS = EnvStr("8192,16384,32768,65536,131072")
-     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
-     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
-     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
-@@ -1375,6 +1379,8 @@ class Envs:
-     # and benchmarks at parity, so this is a consolidation escape hatch, not a perf flip.
-     SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
-     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
-+    SGLANG_OPT_USE_SM75_C4_TOPK = EnvBool(False)
-+    SGLANG_OPT_W8A16_WIDE_M1_K1024 = EnvBool(False)
- 
-     # ===================================================================
-     # Kernel selection and fused backends
-diff --git a/python/sglang/srt/layers/attention/dsv4/indexer.py b/python/sglang/srt/layers/attention/dsv4/indexer.py
-index 159d35b7fb..c3dd429885 100644
---- a/python/sglang/srt/layers/attention/dsv4/indexer.py
-+++ b/python/sglang/srt/layers/attention/dsv4/indexer.py
-@@ -22,6 +22,7 @@ from sglang.kernels.ops.attention.dsv4 import (
-     fused_q_indexer_rope_hadamard_quant,
-     plan_topk_v2,
-     topk_transform_paged,
-+    topk_transform_paged_triton,
-     topk_transform_paged_v2,
- )
- from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
-@@ -621,6 +622,11 @@ class C4IndexerBackendMixin:
-             )
-         return q, weights
- 
-+    def _deepgemm_available(self) -> bool:
-+        from sglang.srt.layers import deep_gemm_wrapper
-+
-+        return deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-+
-     def _can_use_nonpaged_indexer(
-         self,
-         *,
-@@ -648,7 +654,10 @@ class C4IndexerBackendMixin:
-             c4_indexer.use_fp4_indexer
-             or envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
-             or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
--            or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
-+            or (
-+                envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
-+                and self._deepgemm_available()
-+            )
-         ):
-             return False
-         if (
-@@ -694,7 +703,13 @@ class C4IndexerBackendMixin:
-         def to_cpu_int_list(values) -> Optional[List[int]]:
-             if isinstance(values, torch.Tensor):
-                 if values.device.type != "cpu":
--                    return None
-+                    # The DSV4 backend sets needs_cpu_seq_lens=False, so the
-+                    # scheduler hands us the device tensor. The plan is built
-+                    # once per chunk and cached on the metadata, so this
-+                    # one-shot sync is amortized over the chunk's layers and is
-+                    # far cheaper than the paged torch-logits fallback it
-+                    # unlocks (measured 14 ms/layer at a 512-row chunk).
-+                    values = values.cpu()
-                 values = values.tolist()
-             return [int(value) for value in values]
- 
-@@ -994,14 +1009,29 @@ class C4IndexerBackendMixin:
-         ) -> None:
-             row_raw_indices = raw_indices[rows] if raw_indices is not None else None
-             if self.dsa_topk_backend.is_torch():
--                topk_transform_pytorch_vectorized(
--                    logits,
--                    c4_seq_lens[rows],
--                    page_table[rows],
--                    c4_sparse_page_indices[rows],
--                    indexer_metadata.compressed_page_size,
--                    row_raw_indices,
-+                use_sm75_triton = (
-+                    envs.SGLANG_OPT_USE_SM75_C4_TOPK.get()
-+                    and logits.is_cuda
-+                    and torch.cuda.get_device_capability(logits.device)[0] == 7
-                 )
-+                if use_sm75_triton:
-+                    topk_transform_paged_triton(
-+                        logits,
-+                        c4_seq_lens[rows],
-+                        page_table[rows],
-+                        c4_sparse_page_indices[rows],
-+                        indexer_metadata.compressed_page_size,
-+                        row_raw_indices,
-+                    )
-+                else:
-+                    topk_transform_pytorch_vectorized(
-+                        logits,
-+                        c4_seq_lens[rows],
-+                        page_table[rows],
-+                        c4_sparse_page_indices[rows],
-+                        indexer_metadata.compressed_page_size,
-+                        row_raw_indices,
-+                    )
-             elif self.dsa_topk_backend.is_flashinfer():
-                 self.flashinfer_topk_transform(
-                     logits,
-diff --git a/python/sglang/srt/managers/scheduler_pp_mixin.py b/python/sglang/srt/managers/scheduler_pp_mixin.py
-index 71bca7dabf..b893b092bb 100644
---- a/python/sglang/srt/managers/scheduler_pp_mixin.py
-+++ b/python/sglang/srt/managers/scheduler_pp_mixin.py
-@@ -176,6 +176,31 @@ class SchedulerPPMixin:
-                             next_mb_id,
-                         )
-                     )
-+                early_proxy_send = (
-+                    envs.SGLANG_PP_EARLY_PROXY_SEND.get()
-+                    and not self.pp_group.is_last_rank
-+                    and cur_batch is not None
-+                )
-+                if early_proxy_send:
-+                    with torch.profiler.record_function(
-+                        "send_proxy_dict_to_next_stage"
-+                    ):
-+                        self.send_proxy_work = self._pp_send_dict_to_next_stage(
-+                            result.pp_hidden_states_proxy_tensors.tensors,
-+                            async_send=True,
-+                            msg_type="proxy",
-+                            # ready_event, not a wait on the schedule stream
-+                            # here: the wait has to be issued on the comm
-+                            # stream the send runs on, which is what the helper
-+                            # does with it.
-+                            ready_event=self.launch_event,
-+                        )
-+                    # The commit above reads and clears this flag, so the send
-+                    # that happens here has to set it again. Skipping it lets
-+                    # the next forward replay a CUDA graph while NCCL is still
-+                    # reading the previous step's proxy tensors, which are views
-+                    # of replay-owned static buffers.
-+                    self.send_proxy_requires_forward_fence = result.can_run_cuda_graph
-                 if self.mbs[next_mb_id] is not None:
-                     d2h_event.synchronize()
-                     process_target = self.mbs[next_mb_id]
-@@ -190,7 +215,7 @@ class SchedulerPPMixin:
-                             next_batch_result,
-                         )
-                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
--                if not self.pp_group.is_last_rank:
-+                if not early_proxy_send and not self.pp_group.is_last_rank:
-                     if cur_batch:
-                         self._pp_send_proxy_to_next_stage(result)
- 
-diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
-index 62014b49b9..b7c75073bc 100644
---- a/python/sglang/srt/models/deepseek_v4.py
-+++ b/python/sglang/srt/models/deepseek_v4.py
-@@ -5356,9 +5356,16 @@ class DeepseekV4ForCausalLM(nn.Module):
+     def precompile_kernels_after_loading(self) -> None:
+         from sglang.srt.layers.moe.mega_moe import (
+             build_mega_moe_shared_weights,
+@@ -5296,9 +5425,16 @@ class DeepseekV4ForCausalLM(nn.Module):
  
          name = name.replace(".gate.tid2eid", ".topk.tid2eid")
          name = name.replace(".gate.bias", ".gate.e_score_correction_bias")
@@ -6964,7 +7329,7 @@ index 62014b49b9..b7c75073bc 100644
          if "mlp" in name and name.endswith(".scale"):
              name = name.removesuffix(".scale") + ".weight_scale_inv"
  
-@@ -5608,6 +5615,14 @@ class DeepseekV4ForCausalLM(nn.Module):
+@@ -5548,6 +5684,14 @@ class DeepseekV4ForCausalLM(nn.Module):
                              continue
                          if name not in params_dict and name.startswith("mtp"):
                              break
@@ -6979,6 +7344,121 @@ index 62014b49b9..b7c75073bc 100644
                          param = params_dict[name]
                          weight_loader = param.weight_loader
                          maybe_executor_submit(
+@@ -5768,13 +5912,24 @@ class DeepseekV4ForCausalLM(nn.Module):
+             self._prewarm_mhc_kernels()
+ 
+     def get_embed_and_head(self):
++        if not hasattr(self.lm_head, "weight"):
++            raise RuntimeError(
++                "lm_head is stored as fp8 (SGLANG_SM75_LMHEAD_FP8); embedding/"
++                "head sharing needs SGLANG_SM75_LMHEAD_FP8=0"
++            )
+         return self.model.embed_tokens.weight, self.lm_head.weight
+ 
+     def set_embed_and_head(self, embed, head):
+         del self.model.embed_tokens.weight
+-        del self.lm_head.weight
++        if getattr(self.lm_head, "weight_fp8", None) is not None:
++            del self.lm_head.weight_fp8
++            del self.lm_head.weight_scale_inv
++        else:
++            del self.lm_head.weight
+         self.model.embed_tokens.weight = embed
+         self.lm_head.weight = head
++        if envs.SGLANG_SM75_LMHEAD_FP8.get() and self.pp_group.is_last_rank:
++            self._quantize_lm_head_fp8()
+         # Hot weight reload (RL workflows). Use the device-agnostic module
+         # accessor so this works on both CUDA/HIP and NPU.
+         torch.get_device_module().empty_cache()
+@@ -5813,7 +5968,8 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+         weight_f32 * scale.float()[:, None, :, None], "sn bn sk bk -> (sn bn) (sk bk)"
+     )
+ 
+-    return result.to(torch.bfloat16)
++    # Match the model dtype: fp16 on sub-80 (no native bf16), bf16 elsewhere.
++    return result.to(torch.get_default_dtype())
+ 
+ 
+ def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
+diff --git a/python/sglang/srt/utils/triton_load_watch.py b/python/sglang/srt/utils/triton_load_watch.py
+index 27b74efea3..952d71c3bf 100644
+--- a/python/sglang/srt/utils/triton_load_watch.py
++++ b/python/sglang/srt/utils/triton_load_watch.py
+@@ -60,6 +60,74 @@ def install() -> None:
+     _installed = True
+ 
+ 
++_launch_sync_installed = False
++
++
++def install_launch_sync() -> None:
++    """Sync the device after every Triton launch, pinning async faults in place.
++
++    DIAGNOSTIC ONLY; a no-op unless ``SGLANG_TRITON_SYNC_EVERY_LAUNCH=1``.
++
++    ``CUDA_LAUNCH_BLOCKING`` only covers the CUDA Runtime API, and Triton
++    launches through the driver API (``cuLaunchKernel``), so an illegal memory
++    access is reported at whatever eager launch happens to come next — which is
++    why four crash archives each produced a different, innocent frame. A
++    device-wide synchronize immediately after each launch makes the error
++    surface there instead, at worst one launch late. Cost: the device is fully
++    serialized, so this must never stay on while measuring throughput.
++    """
++    global _launch_sync_installed
++    if _launch_sync_installed:
++        return
++    if not envs.SGLANG_TRITON_SYNC_EVERY_LAUNCH.get():
++        return
++    try:
++        from triton.backends.nvidia.driver import CudaLauncher
++    except Exception:
++        logger.debug("Unable to patch Triton's CudaLauncher", exc_info=True)
++        return
++
++    original_call = CudaLauncher.__call__
++
++    def call_and_sync(self, *args, **kwargs):
++        result = original_call(self, *args, **kwargs)
++        _sync_after_launch()
++        return result
++
++    CudaLauncher.__call__ = call_and_sync
++    _launch_sync_installed = True
++    logger.warning(
++        "Syncing the device after every Triton launch "
++        "(SGLANG_TRITON_SYNC_EVERY_LAUNCH=1); throughput from this run is unusable."
++    )
++
++
++def _sync_after_launch() -> None:
++    # cudaDeviceSynchronize is rejected while a graph capture is in flight;
++    # this hook normally installs after engine-init capture, but stay safe.
++    try:
++        if torch.cuda.is_current_stream_capturing():
++            return
++        torch.cuda.synchronize()
++    except RuntimeError as e:
++        # Propagate the fault we are hunting for; swallow incidental errors
++        # (e.g. capture-phase rejections) so the diagnostic cannot mask itself.
++        if any(
++            t in str(e)
++            for t in (
++                "illegal memory access",
++                "unspecified launch failure",
++                "invalid device function",
++                "misaligned address",
++                "assertion",
++            )
++        ):
++            raise
++        logger.debug("sync after Triton launch failed: %s", e)
++    except Exception:
++        logger.debug("sync after Triton launch failed", exc_info=True)
++
++
+ def mark_serving_started() -> None:
+     """Arm diagnostics for subsequent Triton compilations and device-loads."""
+     global _serving_started
 diff --git a/test/registered/unit/managers/test_scheduler_pp_mixin.py b/test/registered/unit/managers/test_scheduler_pp_mixin.py
 new file mode 100644
 index 0000000000..3f884d555d
@@ -7111,39 +7591,3 @@ index 0000000000..3f884d555d
 +
 +if __name__ == "__main__":
 +    unittest.main()
-
-From e0f76063c82addfb8265ba009fc2761b4c844988 Mon Sep 17 00:00:00 2001
-From: Steven Huang <shuang@myai001.mylab.io>
-Date: Wed, 30 Sep 2026 01:49:40 +0800
-Subject: [PATCH 3/3] fix(sm75): declare the sub-90 moe_runner_backend instead
- of assigning it
-
-Resolution no longer writes to the ServerArgs record: assigning
-moe_runner_backend during handle_model_specific_adjustments raises
-"assigned during resolution ... declare the decision with
-declare_resolution". Read through the resolving view and declare, the way the
-rest of this hook and model_path_hook do.
----
- python/sglang/srt/arg_groups/model_hook.py | 9 +++++++--
- 1 file changed, 7 insertions(+), 2 deletions(-)
-
-diff --git a/python/sglang/srt/arg_groups/model_hook.py b/python/sglang/srt/arg_groups/model_hook.py
-index 676ff99727..f2604ad4e7 100644
---- a/python/sglang/srt/arg_groups/model_hook.py
-+++ b/python/sglang/srt/arg_groups/model_hook.py
-@@ -494,8 +494,13 @@ def handle_model_specific_adjustments(server_args: Any):
-                 envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.set(False)
-                 envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
-                 envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
--                if server_args.moe_runner_backend in (None, "auto"):
--                    server_args.moe_runner_backend = "triton"
-+                if cfg.moe_runner_backend in (None, "auto"):
-+                    # Resolution does not write to the record, it declares.
-+                    declare_resolution(
-+                        server_args,
-+                        "_handle_model_specific_adjustments",
-+                        moe_runner_backend="triton",
-+                    )
-                 # The torch top-k path is the only one that can run here (see
-                 # DSATopKBackend._arch_supports_sgl_kernel, which does the
-                 # downgrade at resolve time -- assigning dsa_topk_backend here
