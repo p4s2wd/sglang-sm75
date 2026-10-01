@@ -149,13 +149,21 @@ def _topk_transform_paged_triton_kernel(
     valid = (offs_k < K) & (offs_k < seq_len)
     page_ids = raw // PAGE_SIZE
     page_ids = tl.where(valid, page_ids, 0)
+    # page_table_width is a parameter precisely so this bound exists. `raw` is only
+    # known to be < seq_len, which does not imply raw // PAGE_SIZE < width -- the
+    # documented form of this computation (page_table[i, j // page_size]) requires
+    # it. Without it an out-of-range page_id reads past the row and the garbage page
+    # id flows into extra_indices, where the sparse-attention gather -- which only
+    # masks raw >= 0 and is never handed num_pages -- turns it into an illegal
+    # memory access.
+    in_table = valid & (page_ids >= 0) & (page_ids < page_table_width)
     pages = tl.load(
         page_tables_ptr + row * stride_page_tables + page_ids,
-        mask=valid,
+        mask=in_table,
         other=0,
     )
     page_indices = pages * PAGE_SIZE + raw % PAGE_SIZE
-    page_indices = tl.where(valid, page_indices, -1).to(tl.int32)
+    page_indices = tl.where(in_table, page_indices, -1).to(tl.int32)
     tl.store(
         out_page_indices_ptr + row * K + offs_k,
         page_indices,
