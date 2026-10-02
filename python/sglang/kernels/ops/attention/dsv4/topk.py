@@ -178,6 +178,302 @@ def _topk_transform_paged_triton_kernel(
         )
 
 
+@triton.jit
+def _topk_slab_kernel(
+    scores_ptr,
+    seq_lens_ptr,
+    part_ptr,
+    stride_scores,
+    n_partial,
+    K: tl.constexpr,
+    K_POW2: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    SLAB: tl.constexpr,
+):
+    """Top-K_POW2 of one slab of one row, written out for the merge.
+
+    Identical arithmetic to _topk_transform_paged_triton_kernel -- the same
+    bit-cast, sign-flip and bitonic-merge recurrence -- so each slab's result is
+    exactly the top-K_POW2 of the scores it covers. The recurrence's
+    accumulator is uint64, which matters: roughly half of all real scores pack
+    to a negative int64, and a signed comparison would select the smallest.
+    """
+    pid = tl.program_id(0)
+    row = pid // n_partial
+    s = pid % n_partial
+    seq_len = tl.load(seq_lens_ptr + row)
+    start0 = s * SLAB
+    offs_k = tl.arange(0, K_POW2)
+    # Slabs past the end of a short row must still write, and must write
+    # zeros: zero is below every real packed key, so it sorts last and cannot
+    # displace a winner.
+    if start0 >= seq_len:
+        tl.store(
+            part_ptr + pid * K_POW2 + offs_k,
+            tl.zeros((K_POW2,), tl.uint64).to(tl.int64, bitcast=True),
+        )
+        return
+    end = tl.minimum(start0 + SLAB, seq_len)
+    offs_n = tl.arange(0, BLOCK_N)
+    acc = tl.zeros((K_POW2,), dtype=tl.uint64)
+    for start in range(start0, end, BLOCK_N):
+        cols = start + offs_n
+        score = tl.load(
+            scores_ptr + row * stride_scores + cols,
+            mask=cols < end,
+            other=float("-inf"),
+        )
+        score_bits = score.to(tl.uint32, bitcast=True)
+        sign = tl.full(score_bits.shape, 0x80000000, tl.uint32)
+        key = tl.where(
+            (score_bits & sign) != 0,
+            ~score_bits,
+            score_bits ^ sign,
+        )
+        packed = (key.to(tl.uint64) << 32) | cols.to(tl.uint64)
+        candidate = tl.topk(packed, K_POW2, dim=0)
+        acc = tl.bitonic_merge(acc)
+        acc = tl.maximum(acc, tl.topk(candidate, K_POW2, dim=0))
+    acc = tl.sort(acc, descending=True)
+    tl.store(part_ptr + pid * K_POW2 + offs_k, acc.to(tl.int64, bitcast=True))
+
+
+@triton.jit
+def _topk_merge_sort_kernel(
+    in_ptr,
+    out_ptr,
+    K: tl.constexpr,
+    K_POW2: tl.constexpr,
+    FANIN: tl.constexpr,
+    N_OUT: tl.constexpr,
+    N_IN: tl.constexpr,
+):
+    """out[g] = top-K of in[g*FANIN : (g+1)*FANIN], by sorting the concatenation.
+
+    A full sort is exact by construction, which the bitonic recurrence used
+    inside a slab is not -- it happens to agree on raw score blocks, but it is
+    not a merge of pre-reduced lists. The sort runs on uint64 for the same
+    reason the slab accumulator does.
+
+    FANIN is capped at 2 because tl.sort's shared-memory use grows with the
+    sort width and SM75 has 64 KB: FANIN=8 (4096 int64) already asks for more
+    than that.
+    """
+    pid = tl.program_id(0)
+    row = pid // N_OUT
+    g = pid % N_OUT
+    offs = tl.arange(0, FANIN * K_POW2)
+    vals = tl.load(in_ptr + (row * N_IN + g * FANIN) * K_POW2 + offs)
+    srt = tl.sort(vals.to(tl.uint64, bitcast=True), descending=True)
+    # The K largest of the concatenation are its leading K_POW2 lanes, so the
+    # store is masked rather than a slice; Triton cannot slice a tensor, and
+    # tl.sort returns one rather than a pointer.
+    tl.store(
+        out_ptr + (row * N_OUT + g) * K_POW2 + offs,
+        srt.to(tl.int64, bitcast=True),
+        mask=offs < K_POW2,
+    )
+
+
+@triton.jit
+def _topk_merge_tail_paged_kernel(
+    in_ptr,
+    seq_lens_ptr,
+    page_tables_ptr,
+    out_page_indices_ptr,
+    out_raw_indices_ptr,
+    K: tl.constexpr,
+    K_POW2: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    page_table_width,
+    stride_page_tables,
+    WRITE_RAW: tl.constexpr,
+):
+    """Page-table transform of the final merge level.
+
+    Fusing keeps the parallel path to one kernel per level; left unfused it
+    costs about six small torch ops per token, which is real money against a
+    130 us kernel.
+
+    There is deliberately no sort here. The last merge level already reduced to
+    a single K_POW2 group per row, so this reads exactly K_POW2 lanes at a
+    K_POW2 stride. Reading a wider window would overlap the next row's answer,
+    which is invisible at one row and silently swaps rows at two.
+    """
+    row = tl.program_id(0)
+    offs = tl.arange(0, K_POW2)
+    best = tl.load(in_ptr + row * K_POW2 + offs).to(tl.uint64, bitcast=True)
+    raw = (best & 0xFFFFFFFF).to(tl.int32)
+    seq_len = tl.load(seq_lens_ptr + row)
+    valid = (offs < K) & (offs < seq_len)
+    page_ids = raw // PAGE_SIZE
+    page_ids = tl.where(valid, page_ids, 0)
+    # Same bound, and for the same reason, as the single-program kernel: raw is
+    # only known to be < seq_len, which does not imply raw // PAGE_SIZE is a
+    # valid column of the page table.
+    in_table = valid & (page_ids >= 0) & (page_ids < page_table_width)
+    pages = tl.load(
+        page_tables_ptr + row * stride_page_tables + page_ids,
+        mask=in_table,
+        other=0,
+    )
+    page_indices = pages * PAGE_SIZE + raw % PAGE_SIZE
+    page_indices = tl.where(in_table, page_indices, -1).to(tl.int32)
+    tl.store(
+        out_page_indices_ptr + row * K + offs,
+        page_indices,
+        mask=offs < K,
+    )
+    if WRITE_RAW:
+        raw = tl.where(valid, raw, -1)
+        tl.store(
+            out_raw_indices_ptr + row * K + offs,
+            raw,
+            mask=offs < K,
+        )
+
+
+# Below this allocated row width a single program is already cheap and
+# splitting it costs more than it saves: measured on RTX 2080 Ti, the parallel
+# path runs at 0.84x of the single-program kernel at 6144 and 1.66x at 8192.
+_PARALLEL_MIN_WIDTH = 8192
+# Only for few rows. The single-program kernel already runs one program per row,
+# so it has parallelism of its own; splitting each row is what pays, and that
+# stops paying as rows grow. Measured speedup at width 37500: 5.9x at 1 row,
+# 1.7x at 16, 0.93x at 32. At width 262144: 25.8x at 1, 3.4x at 16, 1.6x at 32,
+# 0.80x at 128. Capping at 16 keeps every win that matters for decode and no
+# regression, and bounds the buffers at 8 MB per shape.
+_PARALLEL_MAX_ROWS = 16
+# 32 partials win below 65536, 64 above it. Both are powers of two so the merge
+# level count stays fixed per branch.
+_PARALLEL_N_PARTIAL_SMALL = 32
+_PARALLEL_N_PARTIAL_LARGE = 64
+_PARALLEL_N_PARTIAL_SPLIT = 65536
+_PARALLEL_FANIN = 2
+# Ceiling on the scratch the cache may hold. Entries are never freed (see
+# below), so without this an unusual sequence of graph buckets would keep
+# growing resident memory on a pipeline that has under a gigabyte of headroom.
+_PARALLEL_BUFFER_BUDGET_ELEMS = 8 * 1024 * 1024
+
+# Buffers are keyed by shape and never released. A captured CUDA graph bakes the
+# pointers in, so reallocating under a live graph would silently make it read
+# someone else's memory. Falling back to the single-program kernel is the safe
+# way to run out of budget.
+_PARALLEL_BUFFERS: dict = {}
+_PARALLEL_BUFFER_ELEMS = 0
+
+
+def _parallel_buffers(rows, n_partial, fanin, K_POW2, device):
+    """Cached scratch for one shape, or None if the budget is exhausted.
+
+    Cached rather than pooled on purpose: a captured CUDA graph holds the
+    pointers, so a buffer freed and reallocated at a different address would
+    turn a graph replay into a read of unrelated memory. Holding it is the only
+    way to keep the capture valid.
+    """
+    global _PARALLEL_BUFFER_ELEMS
+    key = (rows, n_partial, fanin, K_POW2, device.index)
+    bufs = _PARALLEL_BUFFERS.get(key)
+    if bufs is not None:
+        return bufs
+    part_elems = rows * n_partial * K_POW2
+    level_elems = 0
+    cur_n = n_partial
+    while cur_n > 1:
+        cur_n = triton.cdiv(cur_n, fanin)
+        level_elems += rows * cur_n * fanin * K_POW2
+    if _PARALLEL_BUFFER_ELEMS + part_elems + level_elems > \
+            _PARALLEL_BUFFER_BUDGET_ELEMS:
+        return None
+    part = torch.zeros(part_elems, dtype=torch.int64, device=device)
+    levels = []
+    cur_n = n_partial
+    while cur_n > 1:
+        nxt = triton.cdiv(cur_n, fanin)
+        levels.append(
+            torch.zeros(
+                rows * nxt * fanin * K_POW2, dtype=torch.int64, device=device
+            )
+        )
+        cur_n = nxt
+    bufs = (part, levels)
+    _PARALLEL_BUFFERS[key] = bufs
+    _PARALLEL_BUFFER_ELEMS += part_elems + level_elems
+    return bufs
+
+
+def _topk_transform_paged_parallel(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    raw_indices: torch.Tensor,
+    write_raw: bool,
+    page_size: int,
+    K: int,
+    K_POW2: int,
+    BLOCK_N: int,
+) -> bool:
+    """Returns False if it declined to run, having done nothing."""
+    rows, width = scores.shape
+    fanin = _PARALLEL_FANIN
+    n_partial = (
+        _PARALLEL_N_PARTIAL_LARGE
+        if width >= _PARALLEL_N_PARTIAL_SPLIT
+        else _PARALLEL_N_PARTIAL_SMALL
+    )
+    cached = _parallel_buffers(rows, n_partial, fanin, K_POW2, scores.device)
+    if cached is None:
+        return False
+    part, levels = cached
+    n_blocks = triton.cdiv(width, BLOCK_N)
+    slab = triton.cdiv(n_blocks, n_partial) * BLOCK_N
+    _topk_slab_kernel[(rows * n_partial,)](
+        scores,
+        seq_lens,
+        part,
+        scores.stride(0),
+        n_partial,
+        K=K,
+        K_POW2=K_POW2,
+        BLOCK_N=BLOCK_N,
+        SLAB=slab,
+        num_warps=4,
+        num_stages=1,
+    )
+    cur, cur_n = part, n_partial
+    for lvl, dst in enumerate(levels):
+        nxt_n = triton.cdiv(cur_n, fanin)
+        _topk_merge_sort_kernel[(rows * nxt_n,)](
+            cur,
+            dst,
+            K=K,
+            K_POW2=K_POW2,
+            FANIN=fanin,
+            N_OUT=nxt_n,
+            N_IN=cur_n,
+            num_warps=4,
+            num_stages=1,
+        )
+        cur, cur_n = dst, nxt_n
+    _topk_merge_tail_paged_kernel[(rows,)](
+        cur,
+        seq_lens,
+        page_tables,
+        out_page_indices,
+        raw_indices,
+        K=K,
+        K_POW2=K_POW2,
+        PAGE_SIZE=page_size,
+        page_table_width=page_tables.shape[1],
+        stride_page_tables=page_tables.stride(0),
+        WRITE_RAW=write_raw,
+        num_warps=4,
+        num_stages=1,
+    )
+    return True
+
+
 def topk_transform_paged_triton(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -210,6 +506,28 @@ def topk_transform_paged_triton(
         assert raw_indices.dtype == torch.int32
         write_raw = True
     BLOCK_N = max(256, min(K_POW2, 1024))
+    # Dispatch on the allocated row width and row count, not on seq_lens:
+    # inside a captured CUDA graph seq_lens is a device buffer whose values
+    # change per replay, so it cannot select a launch. Width and row count are
+    # fixed for a graph bucket, and the parallel path is correct for any ragged
+    # lengths under the width.
+    if (
+        scores.shape[1] >= _PARALLEL_MIN_WIDTH
+        and scores.shape[0] <= _PARALLEL_MAX_ROWS
+        and _topk_transform_paged_parallel(
+            scores,
+            seq_lens,
+            page_tables,
+            out_page_indices,
+            raw_indices,
+            write_raw,
+            page_size,
+            K,
+            K_POW2,
+            BLOCK_N,
+        )
+    ):
+        return
     grid = (scores.shape[0],)
     _topk_transform_paged_triton_kernel[grid](
         scores,
