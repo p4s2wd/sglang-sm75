@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
@@ -355,6 +356,24 @@ _PARALLEL_FANIN = 2
 # growing resident memory on a pipeline that has under a gigabyte of headroom.
 _PARALLEL_BUFFER_BUDGET_ELEMS = 8 * 1024 * 1024
 
+# Kill switch, so the parallel path can be turned off without a rebuild. It is
+# the only way to attribute a decode regression to this change or to whatever
+# else moved, which is not always decidable from the outside.
+_PARALLEL_ENABLED = os.environ.get("SGLANG_OPT_SM75_PARALLEL_TOPK", "1") != "0"
+
+# One-shot, env-gated trace of which path each shape took and how wide the
+# dispatch actually sees things. /proc/<pid>/environ is not evidence for a
+# forked scheduler -- it renames itself, so the env it reports is stale -- so
+# the only trustworthy record of what a worker did is its own log.
+_PARALLEL_DIAG = os.environ.get("SGLANG_OPT_SM75_TOPK_DIAG", "0") == "1"
+_PARALLEL_DIAG_SEEN: set = set()
+
+
+def _diag(msg):
+    import logging
+
+    logging.getLogger(__name__).warning("[dsv4-topk-diag] %s", msg)
+
 # Buffers are keyed by shape and never released. A captured CUDA graph bakes the
 # pointers in, so reallocating under a live graph would silently make it read
 # someone else's memory. Falling back to the single-program kernel is the safe
@@ -506,13 +525,23 @@ def topk_transform_paged_triton(
         assert raw_indices.dtype == torch.int32
         write_raw = True
     BLOCK_N = max(256, min(K_POW2, 1024))
+    if _PARALLEL_DIAG:
+        key = (scores.shape[1], scores.shape[0])
+        if key not in _PARALLEL_DIAG_SEEN:
+            _PARALLEL_DIAG_SEEN.add(key)
+            _diag(
+                f"enabled={_PARALLEL_ENABLED} width={key[0]} rows={key[1]} "
+                f"K={K} "
+                f"path={'parallel' if (_PARALLEL_ENABLED and key[0] >= _PARALLEL_MIN_WIDTH and key[1] <= _PARALLEL_MAX_ROWS) else 'single'}"
+            )
     # Dispatch on the allocated row width and row count, not on seq_lens:
     # inside a captured CUDA graph seq_lens is a device buffer whose values
     # change per replay, so it cannot select a launch. Width and row count are
     # fixed for a graph bucket, and the parallel path is correct for any ragged
     # lengths under the width.
     if (
-        scores.shape[1] >= _PARALLEL_MIN_WIDTH
+        _PARALLEL_ENABLED
+        and scores.shape[1] >= _PARALLEL_MIN_WIDTH
         and scores.shape[0] <= _PARALLEL_MAX_ROWS
         and _topk_transform_paged_parallel(
             scores,
