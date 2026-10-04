@@ -86,17 +86,24 @@ class DeepSeekV32Detector(BaseFormatDetector):
         self.eot_token = f"</{block}>"
         self.invoke_start_token = f"<{invoke}"
         self.invoke_end_token = f"</{invoke}>"
+        # Models occasionally drop the ｜DSML｜ prefix when closing a tag, so closers
+        # accept its absence. Open tags stay strict, so a tag named in prose is not
+        # mistaken for the start of a call.
+        def _close(tag: str) -> str:
+            return rf"</(?:{self.dsml_token})?{tag}>"
+
         self.parameter_regex = (
-            rf'<{parameter}\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*?)</{parameter}>'
+            rf'<{parameter}\s+name="([^"]+)"'
+            r'(?:\s+string\s*=\s*"?([^"\s>]+)"?)?\s*>(.*?)'
+            + _close(self.parameter_tag_name)
         )
-        self.function_calls_regex = rf"<{block}>(.*?)</{block}>"
-        # Long-form `<｜DSML｜invoke name="x">...</｜DSML｜invoke>` and the
-        # self-closing `<｜DSML｜invoke name="x"/>` shape V4 emits for zero-arg
-        # tools. The `end` group is empty when the closer hasn't streamed in.
+        self.function_calls_regex = rf"<{block}>(.*?)" + _close(
+            self.tool_calls_block_name
+        )
         self.invoke_regex = (
             rf'<{invoke}\s+name="(?P<name>[^"]+)"\s*'
             r"(?:(?P<self_close>/>)"
-            rf"|>(?P<body>.*?)(?P<end>(?:</{invoke}>|$)))"
+            + rf"|>(?P<body>.*?)(?P<end>(?:{_close(self.invoke_tag_name)}|$)))"
         )
         self.current_tool_id = -1
 
@@ -164,18 +171,21 @@ class DeepSeekV32Detector(BaseFormatDetector):
         for match in param_matches:
             leftover.append(invoke_content[last_match_end : match.start()])
             param_name = match.group(1)
-            param_type = match.group(2)
+            raw_type = match.group(2)
             param_value = match.group(3)
+            param_type = raw_type.strip().lower() if raw_type else None
             last_match_end = match.end()
             # Convert value based on type
-            if param_type == "true":  # string type
+            if param_type in ("true", "string"):  # string type
                 parameters[param_name] = (
                     param_value.strip()
                     if self.strip_string_param_value
                     else param_value
                 )
             else:
-                # Try to parse as JSON for other types
+                # Absent, "false", or any other marker: try JSON first, then
+                # fall back to a plain string so a missing/typo'd attribute
+                # does not cause the whole call to be dropped.
                 try:
                     parameters[param_name] = json.loads(
                         param_value.strip(), parse_constant=_reject_json_constant
@@ -188,7 +198,10 @@ class DeepSeekV32Detector(BaseFormatDetector):
         if self.dsml_token in leftover_text or (
             not param_matches and leftover_text.strip()
         ):
-            raise ValueError("Malformed DeepSeek tool parameter")
+            # Keep a truncated leftover snippet so drift stays debuggable without
+            # flooding the log.
+            snippet = leftover_text.strip().replace("\n", "\\n")[:240]
+            raise ValueError(f"Malformed DeepSeek tool parameter: {snippet!r}")
 
         return json.dumps(parameters, ensure_ascii=False)
 
@@ -309,6 +322,17 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 )
                 if not is_tool_end:
                     break
+
+                # Repair a drifted tool name (Bash / Read / functions.bash) instead of
+                # letting a case slip turn into a "Tool X not found" retry loop.
+                func_name = self._canonical_tool_name(func_name, tools)
+                if func_name not in self._get_tool_indices(tools):
+                    # Still forward the call, so the client's error message lets the
+                    # model correct itself; logging keeps this drift class visible.
+                    logger.warning(
+                        "DeepSeek tool call name is not in the tool list: %r",
+                        func_name,
+                    )
 
                 # Initialize state on the first complete invoke, malformed or
                 # not: the preamble is released once and the trailing DSML is

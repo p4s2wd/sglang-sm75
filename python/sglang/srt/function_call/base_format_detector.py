@@ -74,6 +74,43 @@ class BaseFormatDetector(ABC):
             tool.function.name: i for i, tool in enumerate(tools) if tool.function.name
         }
 
+    def _canonical_tool_name(self, name: Any, tools: List[Tool]) -> Any:
+        """
+        Map a model-produced tool name onto the canonical name declared in tools.
+
+        Models occasionally drift when emitting a tool name: capitalising it
+        (``Bash`` for ``bash``), wrapping it in quotes, padding it with
+        whitespace, or prefixing it in OpenAI style (``functions.bash``). Those
+        are still the same tool, so repairing the name keeps the call executable
+        instead of handing the client an "unknown tool" error. Names that do not
+        correspond to any declared tool are returned unchanged (cleaned), and the
+        caller decides whether to drop or forward them.
+
+        Args:
+            name: tool name as produced by the model
+
+        Returns:
+            Canonical tool name when it can be resolved, otherwise the cleaned name
+        """
+        if not isinstance(name, str):
+            return name
+
+        cleaned = name.strip().strip("\"'`")
+        candidates = [cleaned]
+        for prefix in ("functions.", "function.", "tool.", "tool:"):
+            if cleaned.lower().startswith(prefix):
+                candidates.append(cleaned[len(prefix) :])
+
+        tool_indices = self._get_tool_indices(tools)
+        lowered = {n.lower(): n for n in tool_indices}
+        for cand in candidates:
+            if cand in tool_indices:
+                return cand
+            canonical = lowered.get(cand.lower())
+            if canonical is not None:
+                return canonical
+        return cleaned
+
     def parse_base_json(self, action: Any, tools: List[Tool]) -> List[ToolCallItem]:
         tool_indices = self._get_tool_indices(tools)
         if not isinstance(action, list):
@@ -81,7 +118,7 @@ class BaseFormatDetector(ABC):
 
         results = []
         for act in action:
-            name = act.get("name")
+            name = self._canonical_tool_name(act.get("name"), tools)
             if not (name and name in tool_indices):
                 logger.warning(f"Model attempted to call undefined function: {name}")
                 if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():

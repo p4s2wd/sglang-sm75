@@ -1,5 +1,6 @@
 """Unit tests for DeepSeekV4Detector DSML streaming — no server, no model loading."""
 
+import logging
 import unittest
 from unittest.mock import patch
 
@@ -217,7 +218,6 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
         """Leftover text containing a DSML fragment is a parameter that failed
         to match; the call is dropped rather than emitted without it."""
         bodies = {
-            "missing string attr": f'<{DSML}parameter name="city">SF</{DSML}parameter>',
             "self-closing": f'<{DSML}parameter name="city" string="true"/>',
             "unclosed after valid": _param("city", "true", "SF")
             + f'<{DSML}parameter name="units" string="true">C',
@@ -416,6 +416,158 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
         self.assertEqual(first.normal_text, "Checking.")
         self.assertEqual(first.calls, [])
         self.assertEqual(second.normal_text, " tail")
+
+
+def _close(tag: str) -> str:
+    """Closing tag for ``tag``, assembled so the spelling stays in one place."""
+    return "</" + tag + ">"
+
+
+class TestDeepSeekV4DriftTolerance(unittest.TestCase):
+    """Drift observed in a long agentic session on 2026-10-04.
+
+    A client that refuses a tool call over one capital letter turns a soft model
+    slip into a retry loop, so a name that still identifies exactly one declared
+    tool is repaired rather than rejected. A name that matches no declared tool
+    is forwarded unchanged and warned about, leaving the client free to tell the
+    model what it called and the log free to show what drifted.
+    """
+
+    def setUp(self):
+        def declared(name, prop):
+            return Tool(
+                type="function",
+                function=Function(
+                    name=name,
+                    description=f"{name} tool",
+                    parameters={
+                        "type": "object",
+                        "properties": {prop: {"type": "string"}},
+                        "required": [prop],
+                    },
+                ),
+            )
+
+        self.tools = [declared("bash", "command"), declared("read", "path")]
+
+    @staticmethod
+    def _param(body, value, prefixed_closer=True):
+        closer = _close(DSML + "parameter") if prefixed_closer else _close("parameter")
+        return f"<{DSML}parameter {body}>{value}{closer}"
+
+    def _invoke(self, name, parameter):
+        return (
+            f"<{DSML}tool_calls>\n"
+            f'<{DSML}invoke name="{name}">\n{parameter}\n'
+            f"{_close(DSML + 'invoke')}\n{_close(DSML + 'tool_calls')}"
+        )
+
+    def _stream(self, text, width=7):
+        """Parse in small deltas: the repair must not depend on chunk width."""
+        detector = DeepSeekV4Detector()
+        calls = []
+        for start in range(0, len(text), width):
+            result = detector.parse_streaming_increment(
+                text[start : start + width], self.tools
+            )
+            calls.extend(result.calls)
+        calls.extend(detector.parse_streaming_increment("", self.tools).calls)
+        return [(call.name, call.parameters) for call in calls]
+
+    def test_parameter_without_string_attribute_is_still_parsed(self):
+        """A missing string attribute used to cost the whole call; the value is
+        recovered as a string instead."""
+        text = self._invoke("bash", self._param('name="command"', "echo hi"))
+
+        self.assertEqual(self._stream(text), [("bash", '{"command": "echo hi"}')])
+
+    def test_loose_string_attribute_is_still_parsed(self):
+        bodies = {
+            "unquoted": 'name="command" string=true',
+            "capital value": 'name="command" string="True"',
+            "padded": 'name="command" string = "true"',
+        }
+        for label, body in bodies.items():
+            with self.subTest(label=label):
+                text = self._invoke("bash", self._param(body, "pwd"))
+
+                self.assertEqual(self._stream(text), [("bash", '{"command": "pwd"}')])
+
+    def test_closer_without_dsml_prefix_is_accepted(self):
+        """The exact production shape: a correct parameter closed as a plain
+        html tag. Dropping it stalled the agent loop."""
+        text = self._invoke(
+            "bash",
+            self._param(
+                'name="command" string="true"', "echo hello", prefixed_closer=False
+            ),
+        )
+
+        self.assertEqual(self._stream(text), [("bash", '{"command": "echo hello"}')])
+
+    def test_tool_name_drift_is_repaired_to_the_declared_name(self):
+        for spelled, declared in [
+            ("Bash", "bash"),
+            ("BASH", "bash"),
+            (" bash ", "bash"),
+            ("functions.bash", "bash"),
+            ("Read", "read"),
+        ]:
+            with self.subTest(spelled=spelled):
+                text = self._invoke(
+                    spelled, self._param('name="command" string="true"', "ls")
+                )
+
+                self.assertEqual(self._stream(text), [(declared, '{"command": "ls"}')])
+                one_shot = DeepSeekV4Detector().detect_and_parse(text, self.tools)
+                self.assertEqual(
+                    [(call.name, call.parameters) for call in one_shot.calls],
+                    [(declared, '{"command": "ls"}')],
+                )
+
+    def test_quoted_name_is_repaired_where_names_arrive_as_json(self):
+        """The direct-JSON shape and every other detector hand the parsed name
+        straight to parse_base_json, so the quote repair belongs there."""
+        detector = DeepSeekV4Detector()
+        for spelled, declared in [
+            ('"bash"', "bash"),
+            (" bash ", "bash"),
+            ("BASH", "bash"),
+            ("functions.read", "read"),
+        ]:
+            with self.subTest(spelled=spelled):
+                calls = detector.parse_base_json(
+                    {"name": spelled, "parameters": {}}, self.tools
+                )
+
+                self.assertEqual([call.name for call in calls], [declared])
+
+    def test_unknown_tool_name_is_forwarded_with_a_warning(self):
+        text = self._invoke(
+            "exec_command", self._param('name="cmd" string="true"', "ls -la")
+        )
+
+        with self.assertLogs(
+            "sglang.srt.function_call.deepseekv32_detector", logging.WARNING
+        ) as logged:
+            calls = self._stream(text)
+
+        self.assertEqual(calls, [("exec_command", '{"cmd": "ls -la"}')])
+        self.assertTrue(
+            any("not in the tool list" in r.getMessage() for r in logged.records),
+            "an unrecognised name must leave a trace in the server log",
+        )
+
+    def test_unparseable_parameter_still_fails_closed(self):
+        """Tolerance is bounded: a parameter that never closes must not leak a
+        half-read argument into the call."""
+        text = self._invoke(
+            "bash",
+            self._param('name="command" string="true"', "ls")
+            + f'<{DSML}parameter name="timeout" string="true">5',
+        )
+
+        self.assertEqual(self._stream(text), [])
 
 
 if __name__ == "__main__":

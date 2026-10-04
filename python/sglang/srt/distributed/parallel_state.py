@@ -30,6 +30,7 @@ import logging
 import os
 import pickle
 import sys
+import time
 import warnings
 import weakref
 from collections import namedtuple
@@ -243,6 +244,56 @@ def reg_all_to_all_single(
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
     group._all_to_all_single(output, input)
+
+
+_PP_HANDOFF_DIAG = os.environ.get("SGLANG_OPT_PP_HANDOFF_DIAG", "0") == "1"
+# Sample periodically, not once. A single sample lands in warmup, and the
+# receive timing includes waiting for the upstream stage, so the first
+# call is the least representative one available.
+_PP_HANDOFF_EVERY = int(os.environ.get("SGLANG_OPT_PP_HANDOFF_EVERY", "200"))
+_PP_HANDOFF_COUNT: dict = {}
+
+
+def _pp_sample(tag: str, ident: int) -> bool:
+    """True on every Nth call for this site. No-op when the diag is off."""
+    if not _PP_HANDOFF_DIAG:
+        return False
+    key = (tag, ident)
+    n = _PP_HANDOFF_COUNT.get(key, 0) + 1
+    _PP_HANDOFF_COUNT[key] = n
+    return n % _PP_HANDOFF_EVERY == 0
+
+
+def _pp_handoff_diag(payload: str) -> None:
+    """Log one decomposition of a pipeline handoff, once per rank per side.
+
+    A py-spy profile puts about a quarter of the bs=1 decode step inside
+    recv_tensor_dict, but says nothing about which part of it. Whether the cost
+    is the pickled-metadata round trip, the per-tensor blocking receive, or the
+    all-gather decides what is worth changing, and guessing has already produced
+    one wrong conclusion today.
+
+    Host-side timing only, and nothing here synchronises with the device: this
+    runs inside captured CUDA graphs, so one added .item() would break capture.
+    Off unless SGLANG_OPT_PP_HANDOFF_DIAG=1, and when off the only cost is a set
+    lookup.
+    """
+    logger.warning("[pp-handoff-diag] %s", payload)
+
+
+def _pp_payload_desc(tensor_list) -> str:
+    """Compact description of what a handoff carries at bs=1."""
+    parts = []
+    total = 0
+    for t in tensor_list[:8]:
+        try:
+            nb = t.numel() * t.element_size()
+        except Exception:
+            nb = 0
+        total += nb
+        parts.append(f"{tuple(t.shape)}:{str(t.dtype).replace('torch.', '')}")
+    more = "" if len(tensor_list) <= 8 else f" +{len(tensor_list) - 8} more"
+    return f"n={len(tensor_list)} bytes={total} [{', '.join(parts)}{more}]"
 
 
 class GroupCoordinator:
@@ -1785,6 +1836,8 @@ class GroupCoordinator:
                 async_handle.wait()
         return tensor_dict
 
+
+
     def send_tensor_dict(
         self,
         tensor_dict: Dict[str, Union[torch.Tensor, Any]],
@@ -1792,6 +1845,7 @@ class GroupCoordinator:
         all_gather_group: Optional["GroupCoordinator"] = None,
         async_send: bool = False,
     ) -> Optional[List[P2PWork]]:
+        _dg = _pp_sample("send", id(self))
         """Send the input tensor dictionary.
         NOTE: `dst` is the local rank of the source rank.
         """
@@ -1823,7 +1877,10 @@ class GroupCoordinator:
         # Thus the net performance gain justifies this approach.
 
         send_func = torch.distributed.isend if async_send else torch.distributed.send
+        _t0 = time.perf_counter() if _dg else 0.0
         p2p_works = self.send_object(metadata_list, dst=dst, async_send=async_send)
+        _t1 = time.perf_counter() if _dg else 0.0
+        _n_ag = 0
 
         for tensor in tensor_list:
             if tensor.numel() == 0:
@@ -1833,11 +1890,20 @@ class GroupCoordinator:
             # send-allgather: send only a slice, then do allgather.
             if all_gather_group is not None and tensor.numel() % all_gather_size == 0:
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
+                _n_ag += 1
 
             comm_group = metadata_group if tensor.is_cpu else group
             work = send_func(tensor, self.ranks[dst], group=comm_group)
             if async_send:
                 p2p_works.append(P2PWork(work, tensor))
+        if _dg:
+            _t2 = time.perf_counter()
+            _pp_handoff_diag(
+                f"SEND metadata={_t1 - _t0:.3f}ms "
+                f"tensors={_t2 - _t1:.3f}ms(n={len(tensor_list)},"
+                f"allgather={_n_ag}) payload={_pp_payload_desc(tensor_list)} "
+                f"pickle_bytes={len(pickle.dumps(metadata_list))}"
+            )
         return p2p_works
 
     def recv_tensor_dict(
@@ -1864,7 +1930,13 @@ class GroupCoordinator:
             src = (self.rank_in_group - 1) % self.world_size
         assert src < self.world_size, f"Invalid src rank ({src})"
 
+        _dg = _pp_sample("recv", id(self))
+        _t0 = time.perf_counter() if _dg else 0.0
         recv_metadata_list = self.recv_object(src=src)
+        _t1 = time.perf_counter() if _dg else 0.0
+        _t_irecv = 0.0
+        _t_ag = 0.0
+        _n_ag = 0
         tensor_dict: Dict[str, Any] = {}
         for key, value in recv_metadata_list:
             if isinstance(value, TensorMetadata):
@@ -1886,18 +1958,31 @@ class GroupCoordinator:
 
                 # We have to use irecv here to make it work for both isend and send.
                 comm_group = metadata_group if tensor.is_cpu else group
+                _a = time.perf_counter() if _dg else 0.0
                 work = torch.distributed.irecv(
                     tensor, src=self.ranks[src], group=comm_group
                 )
                 work.wait()
+                if _dg:
+                    _t_irecv += time.perf_counter() - _a
+                    _a = time.perf_counter()
 
                 if use_all_gather:
                     tensor = all_gather_group.all_gather(tensor, dim=0)
                     tensor = tensor.reshape(orig_shape)
+                    if _dg:
+                        _t_ag += time.perf_counter() - _a
+                        _n_ag += 1
 
                 tensor_dict[key] = tensor
             else:
                 tensor_dict[key] = value
+        if _dg:
+            _pp_handoff_diag(
+                f"RECV metadata={_t1 - _t0:.3f}ms "
+                f"irecv={_t_irecv:.3f}ms allgather={_t_ag:.3f}ms(n={_n_ag}) "
+                f"total={time.perf_counter() - _t0:.3f}ms"
+            )
         return tensor_dict
 
     def send_recv_tensor_dict(
