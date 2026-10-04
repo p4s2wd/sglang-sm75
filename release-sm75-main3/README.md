@@ -1,25 +1,36 @@
 # sglang SM75 optimizations on current main — DeepSeek-V4-Flash on RTX 2080 Ti
 
-This is the `sm75-dsv4-flash` work (51 commits on 0.5.19.dev332) plus the opt4
-layer, rebased onto current `main` (`98fce73d5b`) and verified on the 8x 2080 Ti
-box. Same behaviour as the opt3+opt4 build it replaces, on a base that is 1235
-commits newer.
+This is the `sm75-dsv4-flash` line, rebased onto upstream `main`
+(`98fce73d5b`) and verified on the 8x 2080 Ti box. `sm75main3` is six commits
+over `sm75main2`, on the same base.
 
-- wheel: `sglang-0.5.21.dev797+g331faaeaf7.sm75main2-py3-none-any.whl`
+- wheel: `sglang-0.5.21.dev803+ga588149ab0.sm75main3-py3-none-any.whl`
 - the whole change as one patch against upstream main: `sm75-optimizations.patch`
-- the ten commits since sm75main1 as patches: `sm75-main2-series.patch`
-- launcher: `launch-dsv4-sm75.sh` (identical to `/data/nvme/sglang/deepseek-v4-flash.sh`)
+- the six commits since sm75main2 as patches: `sm75-main3-series.patch`
+- launcher: `launch-dsv4-sm75.sh`, copied from `/data/nvme/sglang/deepseek-v4-flash.sh`
+  as of this release. The `sm75main2` copy had drifted: it still shipped
+  `--chunked-prefill-size 512` where production had moved to 256.
 - environment: `prod-constraints.txt` (a copy of the opt4 one with
   `sglang-kernel` bumped to 0.4.7, which current main requires)
 - rebuild: `build-wheel.sh`, which is byte-reproducible -- two runs of the same
   commit produce the same sha256, so the checksum in `SHA256SUMS` is
   reproducible and not just descriptive
 
-中文说明：本目录是 SM75 优化版在**当前 main 基线**上的重新移植版（内容与之前的
-opt3+opt4 一致，基线更新了 1235 个 commit），已在 8x 2080 Ti 上做过 A/B 验证。
-**`sm75main2` 相对 `sm75main1` 修掉了一个必现的 illegal memory access**
-（`dsv4/topk.py` 缺页表宽度上界，默认配置下几个 prompt 内必崩），详见
-`RELEASE_NOTES.md`。
+## New in sm75main3
+
+| change | what it means |
+|---|---|
+| **the 256K context is real, not just declared** | The KV pool was sized at 162,304 tokens because SWA bytes were charged to every layer instead of the two layers that own a sliding window. With that fixed the pool clears the 262,144 that was asked for (264,192 on this box). The freed bytes become pool, not headroom, so the launcher now asks for `--chunked-prefill-size 256` to pay for a 256K prefill's transient buffers. |
+| **tool calls survive model drift** | A parameter missing its `string` attribute, a closer missing its `｜DSML｜` prefix, or a tool name with the wrong case no longer costs the call. Agent loops were losing whole turns, or spinning on `Tool Bash not found`. |
+| **long-context top-K stops running on one SM** | The sparse top-k transform launched one program on one of 68 SMs. Slabling it is 1.7x at 8K row width and 25.6x at 262K, output byte-identical. `SGLANG_OPT_SM75_PARALLEL_TOPK=0` disables it. |
+
+中文说明:本目录是 SM75 优化版在**当前 main 基线**(`98fce73d5b`)上的持续维护版,
+已在 8x 2080 Ti 上实测。`sm75main3` 相对 `sm75main2` 有六项改动,其中三项影响使用:
+**256K 上下文从"声明"变成"真实"**(SWA 显存被重复计费,KV pool 原本只有 162,304
+token,修好后达 264,192);**工具调用容忍模型格式漂移**(缺 `string` 属性、闭合标签
+漏 `｜DSML｜`、工具名大小写漂移都不再丢弃整条调用);**长上下文 top-K 从单 SM 占用改为
+跨 SM 并行**(262K 行宽下 25.6x,输出逐字节一致)。另外 `sm75main1` 及更早版本有必崩
+的 illegal memory access,请勿在新机器部署。详见 `RELEASE_NOTES.md`。
 
 ## ⚠ sm75main1 crashes on the stock configuration
 
@@ -34,9 +45,12 @@ attribution story.
 ## ⚠ The launcher defaults to a VRAM-tight layer split
 
 `SGLANG_PP_LAYER_PARTITION=11,11,11,10` is worth **+7.6% prefill** and is the
-default. It puts 11 layers on PP0, which drops PP0's headroom from 0.93 GB to
-0.64 GB -- the tightest rank in the fleet, and the first thing that breaks if you
-widen graph buckets, raise the context, or push `--mem-fraction-static` higher.
+default. It puts 11 layers on PP0, the tightest rank in the fleet. Since the SWA
+accounting fix in this release that headroom is smaller by design: the bytes that
+came back went into the KV pool, so PP0 now ends at **0.46 GB** (it was 0.64 GB),
+and **PP3 at 0.64 GB becomes the binding rank**. Anything that widens memory use
+-- more graph buckets, a higher `--mem-fraction-static`, a bigger
+`--chunked-prefill-size` -- should be checked against PP3 first.
 
 Revert with `SGLANG_PP_LAYER_PARTITION= ./launch-dsv4-sm75.sh`. The declaration
 deliberately uses `${VAR-default}` rather than `${VAR:-default}`: with `:-` an
@@ -96,7 +110,7 @@ See `INSTALL.md`. Short version, into a Python 3.12 venv that already runs this
 model on sm75:
 
 ```bash
-pip install --no-deps --force-reinstall sglang-0.5.21.dev797+g331faaeaf7.sm75main2-py3-none-any.whl
+pip install --no-deps --force-reinstall sglang-0.5.21.dev803+ga588149ab0.sm75main3-py3-none-any.whl
 pip install "sglang-kernel==0.4.7"        # current main requires >= 0.4.7
 ```
 
@@ -108,6 +122,12 @@ pip install "sglang-kernel==0.4.7"        # current main requires >= 0.4.7
   prefill materialises `[tokens, 128 heads, 512]` fp32 per layer.
 - `--mem-fraction-static` must stay >= 0.969: the weights are 96.8% of a 22 GiB
   card.
+- PP0 compiles some Triton kernels **while serving**, and each load takes device
+  memory that is not there: `free device mem` on that rank was seen falling from
+  0.33 GiB to 0.18 GiB as `get_and_clear_swa_pages_kernel` and others loaded
+  late. Pre-loading them at engine init would remove the last avoidable OOM
+  candidate on that rank; nobody has done it yet. Watch for it when you change
+  kernel paths.
 - `kv-cache-dtype fp8_e4m3` is the default and the suspected contributor to
   long-context degradation on this path; `auto` (bf16) needs roughly 2x the KV
   pool.

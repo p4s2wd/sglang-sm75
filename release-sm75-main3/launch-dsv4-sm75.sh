@@ -66,7 +66,17 @@ CTX="${CTX:-262144}"
 # through the triton decode kernel, and _merge_partial_attn materializes
 # [tokens, 128 heads, 512] fp32 temporaries -- at 2048 tokens that is >1 GiB
 # per layer and OOMs a PP3 card during warmup (measured 2026-09-25).
-CHUNK="${CHUNK:-512}"
+#
+# Lowered 512 -> 256 on 2026-10-02, and not for throughput: measured roughly
+# neutral (short prompts +16%, long prompts -10%, mean ~0.98x). It is here
+# because a 256-token chunk halves the two prefill transients that decide
+# whether a 256K prompt can be prefilled at all on PP0, which has under
+# 0.5 GB free: the indexer's [Q, max_seqlen_k] fp32 logits (133 -> 66 MiB at
+# 258K context) and the per-tile score buffer in fp16_mqa_logits_triton
+# (_CHUNK 1024 -> 256, so 64 -> 16 MiB). Together ~115 MiB against a ~57 MiB
+# shortfall. Verified: a 258,941-token prefill completes, greedy output is
+# byte-identical, and 200 GSM8K questions at parallel 8 run with zero crashes.
+CHUNK="${CHUNK:-256}"
 
 # Throughput. --max-running-requests also sets pp_max_micro_batch_size
 # (= MAXREQ / PP), i.e. how full the pipeline can get.
@@ -161,6 +171,13 @@ export SGLANG_PP_EARLY_PROXY_SEND="${SGLANG_PP_EARLY_PROXY_SEND:-0}"
 export SGLANG_OPT_W8A16_WIDE_M1_K1024="${SGLANG_OPT_W8A16_WIDE_M1_K1024:-0}"
 export SGLANG_DSV4_DECODE_SEQ_LEN_BUCKETS="${SGLANG_DSV4_DECODE_SEQ_LEN_BUCKETS:-4096,8192,16384,32768,65536,131072}"
 
+# Must be exported, not just assigned above: sglang reads it with os.getenv
+# inside get_pp_indices, not as a server arg, so an unexported shell variable
+# never reaches the server process. Without this export the F3 default is
+# silently ignored and the box comes up on sglang's own 10,11,11,11 split,
+# which measures 7.6% slower on prefill.
+export SGLANG_PP_LAYER_PARTITION
+
 # Prefill indexer logits: the default gate (8192 query tokens) disables the
 # fused Triton fp16 MQA-logits path for every chunked prefill on this box
 # (chunk < 8192), leaving the paged torch fallback, which gathers + dequantizes
@@ -168,6 +185,25 @@ export SGLANG_DSV4_DECODE_SEQ_LEN_BUCKETS="${SGLANG_DSV4_DECODE_SEQ_LEN_BUCKETS:
 # to the chunk size routes single-request prefill through the Triton kernel.
 export SGLANG_OPT_DSV4_NONPAGED_INDEXER="${SGLANG_OPT_DSV4_NONPAGED_INDEXER:-1}"
 export SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS="${SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS:-64}"
+
+# PyTorch's caching allocator, on PP0's prefill path.
+#
+# A 257K prefill died with "Tried to allocate 44.00 MiB ... 35.25 MiB is free"
+# while the same message reported 119.90 MiB reserved-but-unallocated. The
+# memory was there; it was fragmented into pieces smaller than the request.
+# expandable_segments lets a reserved segment grow instead of demanding a fresh
+# contiguous block, which is exactly the case that fails here.
+#
+# Why it shows up on PP0 and only near 256K: PP0 carries the indexer and the
+# MoE align buffers, and the prefill scratch is sized
+# num_tokens*topk + (E+1)*(block_m-1) rows -- 3855 of those rows are pure
+# padding at any chunk size, so the transient peak barely moves when the chunk
+# shrinks. What varies is how much is left over, and near a full pool the
+# leftover is whatever the allocator happened to cache.
+#
+# The MoE padding term is the structural half of this and is not addressed
+# here; see NOTES-2026-10-02-longctx.md.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 LOG_DIR="${LOG_DIR:-$PWD/logs}"
 LOG_NAME="${LOG_NAME:-serve-prod}"

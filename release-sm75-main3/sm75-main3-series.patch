@@ -1,0 +1,1326 @@
+From 8021c84515db3ef30884bcbc8972be721a1cd075 Mon Sep 17 00:00:00 2001
+From: Steven Huang <shuang@myai001.mylab.io>
+Date: Fri, 2 Oct 2026 00:29:00 +0800
+Subject: [PATCH 1/6] docs: production safety rules for this checkout
+
+This tree is the live production code -- the venv installs sglang in editable
+mode against python/ here -- so a branch switch replaces the source under the
+running server.
+
+Incident, 2026-10-02: `git checkout -b release/sm75main2`, branched from
+release/sm75main1, dropped python/sglang/kernels/ops/moe/moe_align.py. That
+module came in with the seven commits made on the evening of 2026-09-30, after
+the sm75main1 snapshot was cut. It is imported lazily, so startup succeeded and
+the first request killed the server with ModuleNotFoundError; the gloo
+"connection closed by peer" errors that followed were cascade noise.
+
+Written down because the failure mode is invisible from the outside: the
+checkout succeeds, the server starts, health checks pass, and nothing breaks
+until a request arrives. The rules here are to use a separate worktree or git
+archive, to keep release/sm75mainN snapshots and the development line clearly
+distinct, and to verify the server after anything that touches this tree.
+---
+ PRODUCTION-SAFETY.md | 50 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 50 insertions(+)
+ create mode 100644 PRODUCTION-SAFETY.md
+
+diff --git a/PRODUCTION-SAFETY.md b/PRODUCTION-SAFETY.md
+new file mode 100644
+index 0000000000..64167237ef
+--- /dev/null
++++ b/PRODUCTION-SAFETY.md
+@@ -0,0 +1,50 @@
++# Production safety rules
++
++This checkout is the **live production code**. The venv at
++`/data/nvme/sglang/.venv` has sglang installed in editable mode against
++`/data/nvme/sglang-codex/sglang/python`, so the working tree here *is* the code
++the server runs. The launcher is `/data/nvme/sglang/deepseek-v4-flash.sh`.
++
++## Never switch branches in this directory
++
++`git checkout` here replaces the entire source tree under the running server.
++
++Incident, 2026-10-02: `git checkout -b release/sm75main2` (branched from
++`release/sm75main1`, a 2026-09-30 morning snapshot) removed
++`python/sglang/kernels/ops/moe/moe_align.py`, which had arrived in the seven
++commits made later that evening. That module is imported lazily, so startup
++succeeded and the first request killed the server:
++
++```
++ModuleNotFoundError: No module named 'sglang.kernels.ops.moe.moe_align'
++```
++
++The follow-on `gloo ... Connection closed by peer` errors were cascade noise.
++This was not an IMA regression.
++
++## Rules
++
++1. **Do not `git checkout` / `git switch` in this directory.** To look at or
++   build another branch, use a separate worktree:
++
++   ```sh
++   git -C /data/nvme/sglang-codex/sglang worktree add /tmp/wt-sm75main1 <ref>
++   ```
++
++   or `git archive <ref> | tar -x -C /tmp/somewhere`. Never in place.
++
++2. **Production branch is `sm75-dsv4-flash-main`.** `release/sm75mainN` branches
++   are release snapshots: they carry the wheel and the release docs, and their
++   source tree is *not* the development line.
++
++3. **After anything that touches this working tree, verify the server** --
++   a branch switch compiles fine and only shows up on the next request:
++
++   ```sh
++   pgrep -f '[b]in/sglang' | wc -l
++   curl -s -m 5 localhost:8200/health
++   ```
++
++4. **The untracked `python/`, `rust/`, `test/` trees are build residue** from
++   `build-wheel.sh` (2.1 GB of rust `target/`). They are not source. Leave them
++   alone and never `git add -A` here.
+-- 
+2.43.0
+
+
+From 2fb2c126ceb2a04e4e4f4142103201a225838ed4 Mon Sep 17 00:00:00 2001
+From: Steven Huang <shuang@myai001.mylab.io>
+Date: Fri, 2 Oct 2026 02:13:05 +0800
+Subject: [PATCH 2/6] fix(dsv4): charge SWA bytes only to the layers that own a
+ sliding window
+
+The KV pool was sized at 162,304 tokens on a model configured for 262,144, and
+the reason was an overcount rather than a hardware limit.
+_get_bytes_per_swa_token multiplied the paged SWA cost by num_layers_total,
+i.e. by every layer the stage owns. Only layers whose compress ratio is 0 are
+sliding-window layers; the rest are sparse-attention layers with no SWA pool at
+all. In the DeepSeek-V4-Flash split the SWA layers are 0 and 1 and both land on
+PP1, so PP0, PP2 and PP3 were each paying SWA bytes for a pool they never
+allocate:
+
+  stage  local_layers  ratios                                    swa charged
+  PP0    11            [4,4,4,4,4,4,128,128,128,128,128]        835.50  (0 SWA layers)
+  PP1    11            [0,0,4,4,4,4,4,128,128,128,128]          803.50  (2)
+  PP2    11            [4,4,4,4,4,128,128,128,128,128,128]      803.50  (0)
+  PP3    10            [4,4,4,4,4,128,128,128,128,128]          745.00  (0)
+
+PP0's bytes_per_full_token falls from 1944.75 to 1109.25, which at
+--mem-fraction-static 0.97 raises the pool to 267,776 tokens -- above the
+262,144 the launcher asks for, so --context-length 262144 stops being fiction.
+The c4 state term is deliberately left alone: it is priced per c4 layer and
+every stage owns c4 layers.
+
+The freed memory does not become headroom, it becomes pool, so PP0 now ends at
+0.46 GB instead of 0.64 GB. That is enough for the pool but not for a 256K
+prefill, which needs the indexer's [Q, max_seqlen_k] fp32 logits and the score
+tile in fp16_mqa_logits_triton. So the same commit takes the two transients
+down: chunked-prefill-size 512 -> 256 in the launcher halves the logits buffer
+(133 -> 66 MiB at 258K context), and _CHUNK 1024 -> 256 here takes the score
+tile from 64 to 16 MiB. Both are pure tiling, so the mm reads the same values.
+
+Verified on 8x RTX 2080 Ti, TP2 x PP4: pool 267,776; a 258,941-token prefill
+completes; greedy output byte-identical to the previous build on 6/6 prompts;
+200 GSM8K questions at parallel 8 with accuracy 0.945 and zero crashes or
+unhandled CUDA errors.
+
+The prefill cost of the smaller chunk is roughly neutral -- short prompts +16%,
+long prompts -10%, mean ~0.98x -- and PP3 at 0.64 GB remains the binding rank.
+---
+ .../ops/attention/dsa/triton_mqa_logits.py    | 19 +++++--
+ .../srt/model_executor/pool_configurator.py   | 49 ++++++++++++++++++-
+ 2 files changed, 64 insertions(+), 4 deletions(-)
+
+diff --git a/python/sglang/kernels/ops/attention/dsa/triton_mqa_logits.py b/python/sglang/kernels/ops/attention/dsa/triton_mqa_logits.py
+index 100507721f..7844a359b9 100644
+--- a/python/sglang/kernels/ops/attention/dsa/triton_mqa_logits.py
++++ b/python/sglang/kernels/ops/attention/dsa/triton_mqa_logits.py
+@@ -38,7 +38,12 @@ import math
+ 
+ import torch
+ 
+-_CHUNK = 1024
++# Tile width for the [Q*H, C] score tile in fp16_mqa_logits_triton. At 1024
++# the tile is 64 MiB for a 512-token prefill chunk, and that allocation is what
++# OOMs PP0 when prefilling a 256K context -- the stage has under 0.5 GB free
++# and came up ~57 MiB short. The mm reads the same values at any tile width, so
++# this is purely a memory/speed knob with no numerical effect.
++_CHUNK = 256
+ 
+ # Comfortably below fp16 max (65504). The scales are exact powers of two, so
+ # this only has to cover the slack left by the log2 rounding in _pow2_floor.
+@@ -102,7 +107,6 @@ def fp16_mqa_logits_triton(
+             return mqa_logits_smallq(q_fp8, k_fp8, k_scale, weights, ks, ke, out)
+     N = out.shape[1]
+     K = k_fp8.shape[0]
+-    k16 = k_fp8.to(torch.float16)
+     q16 = q_fp8.reshape(Q, H, D).to(torch.float16)
+ 
+     q_scale, w_scale, inv = _plan_scales(q_fp8.dtype, D, H, weights)
+@@ -118,7 +122,16 @@ def fp16_mqa_logits_triton(
+     n_scored = min(N, K)
+     for c0 in range(0, n_scored, chunk):
+         c1 = min(c0 + chunk, n_scored)
+-        s = torch.mm(q16, k16[c0:c1].t())  # [Q*H, C] fp16, tensor cores
++        # Convert per chunk rather than promoting the whole gathered key set
++        # once. k_fp8 is [K, D] and K grows with the context, so the up-front
++        # fp16 copy is O(K*D) of extra device memory -- at a 260K context it
++        # competes with the KV pool for the same card and this call is what
++        # OOMs on PP0. The loop already walked the keys in chunks for the mm,
++        # so promoting inside the loop costs one extra pass over each chunk and
++        # drops the peak from O(K*D) to O(chunk*D). Elementwise, so the values
++        # fed to torch.mm are bit-identical to the whole-tensor version.
++        k16 = k_fp8[c0:c1].to(torch.float16)
++        s = torch.mm(q16, k16.t())  # [Q*H, C] fp16, tensor cores
+         s.relu_()
+         acc = torch.bmm(w16, s.view(Q, H, c1 - c0)).float()  # [Q, 1, C]
+         acc = acc.squeeze(1) * inv * k_scale[c0:c1].unsqueeze(0)
+diff --git a/python/sglang/srt/model_executor/pool_configurator.py b/python/sglang/srt/model_executor/pool_configurator.py
+index b0417d545f..143f02d4d3 100644
+--- a/python/sglang/srt/model_executor/pool_configurator.py
++++ b/python/sglang/srt/model_executor/pool_configurator.py
+@@ -1251,7 +1251,19 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
+         c4_indexer_state_bytes = 2 * 2 * self.indexer_head_dim * c4_state_dtype_size
+ 
+         c4_state_ratio = self.ring_sizes.get(4, 0) / self.page_size
+-        return self._get_paged_kv_bytes_per_token() * self.num_layers_total + (
++        # Only layers whose compress ratio is 0 are sliding-window layers; the
++        # others are sparse-attention layers that own no SWA pool at all.
++        # Charging every local layer for SWA bytes made PP0 pay 835.50 of its
++        # 1944.75 bytes/token to a pool it never allocates: in the
++        # DeepSeek-V4-Flash split the SWA layers are 0 and 1, both of which land
++        # on PP1, so PP0/PP2/PP3 have an empty swa pool. That overcount is what
++        # capped the pool at 162,304 tokens, i.e. below the 262,144 this model
++        # is configured for. The c4 state term is left alone: it is priced per
++        # c4 layer and every stage owns c4 layers.
++        swa_layers = sum(1 for r in self.stage_compress_ratios if r == 0)
++        if swa_layers == 0:
++            return 0.0
++        return self._get_paged_kv_bytes_per_token() * swa_layers + (
+             c4_state_ratio
+             * (c4_state_bytes + c4_indexer_state_bytes)
+             * self.num_layers(4)
+@@ -1513,6 +1525,41 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
+             )
+ 
+         sizes = self._compute_dsv4_sizes(full_token, page_size)
++        if envs.SGLANG_DEBUG_MEMORY_POOL.get():
++            # DIAGNOSTIC: bytes_per_full_token is a single opaque number in the
++            # log line below, and it is the binding constraint on context
++            # length -- at 1944.75 B/token a 22 GiB card only reaches ~162K
++            # tokens. Print the per-component split so a change can be aimed at
++            # the dominant term instead of guessed at.
++            _swa = (
++                0 if (self._unified or self.swa_cap_tokens is not None)
++                else self.swa_ratio * self.bytes_per_swa_token
++            )
++            _per_layer = {
++                r: self._compressed_bytes_per_full_token(r) * len(ls)
++                for r, ls in self.stage_owner_layers.items()
++            }
++            logger.info(
++                "DSV4 bytes/token breakdown: "
++                f"total={self.bytes_per_full_token:.2f} "
++                f"swa={_swa:.2f} "
++                + " ".join(f"c{r}={v:.2f}(x{len(self.stage_owner_layers[r])})"
++                           for r, v in sorted(_per_layer.items()))
++                + f" | per-layer: "
++                + " ".join(f"c{r}={self._compressed_bytes_per_full_token(r):.2f}"
++                           for r in sorted(self.stage_owner_layers))
++                + f" | paged_kv: "
++                + " ".join(
++                    f"r{r}={self._get_paged_kv_bytes_per_token(r):.1f}"
++                    f"/ps{self.page_size // r if r else self.page_size}"
++                    for r in sorted(self.stage_owner_layers))
++                + f" | indexer={self.indexer_bytes_per_token:.0f} "
++                f"kv_bytes={self.kv_bytes:.0f} "
++                f"swa_ratio={self.swa_ratio} "
++                f"swa_cap={self.swa_cap_tokens} "
++                f"local_layers={self.num_layers_total} "
++                f"ratios={sorted(self.stage_compress_ratios)}"
++            )
+         logger.info(
+             f"DSV4 memory calculation: unified={self._unified}, "
+             f"unified_fp8={self._unified_fp8}, "
+-- 
+2.43.0
+
+
+From 551da196b15a0f4fff9bd390a8a3eeb6c13355e5 Mon Sep 17 00:00:00 2001
+From: Steven Huang <shuang@myai001.mylab.io>
+Date: Fri, 2 Oct 2026 12:13:10 +0800
+Subject: [PATCH 3/6] perf(dsv4): parallelise the sparse top-K across SMs at
+ long context
+
+The trace showed _topk_transform_paged_triton_kernel running with a grid of
+[1,1,1] on every decode step: one program, one SM out of 68. At bs=1 that is
+1.5% occupancy, and the step grows with context -- 32x to 39x from 4K to
+150K, about 8.7 ms/token across the four decode stages at 150K, roughly 16%
+of long-context decode.
+
+Split each row into slabs, give each slab its own program, and merge. The merge
+is a full tl.sort of each fan-in group rather than the in-kernel bitonic
+recurrence, because a sort of the concatenation is exact by construction while
+the recurrence is only a merge of raw blocks, not of pre-reduced lists. That
+distinction cost some speed and bought certainty: 100+ configurations verified
+byte-identical to torch.topk across widths 2048 to 262144, ragged batches of 1
+to 16 rows, and constant, tied, zero, negative and infinite scores.
+
+Two things the merge depends on and that are easy to get wrong:
+
+  Sign. A packed key is (float_bits << 32) | column, and for a positive float
+  the key is float_bits ^ 0x80000000, which reaches 0xFFFFFFFF. The shift sets
+  bit 63, so about half of all real scores are negative as int64. Compared
+  signed, the sort returns the 512 *smallest* scores and lets zero padding take
+  every output slot. The slab accumulator is uint64 in the original kernel and
+  stays uint64; the merge loads and stores through bitcasts for the same reason.
+
+  Width. tl.sort's shared-memory use grows with the sort width and SM75 has
+  64 KB -- FANIN=16 asks for 256 KB and fails to launch. FANIN is 2.
+
+Dispatched on the allocated row width and row count, never on seq_lens: inside
+a captured CUDA graph seq_lens is a device buffer that changes per replay, so
+it cannot pick a launch. Both are fixed per graph bucket, and the path is exact
+for any ragged lengths under them. Thresholds are measured, not guessed -- the
+parallel path runs at 0.84x of the single-program kernel at width 6144 and
+0.93x at 32 rows, so it engages from width 8192 and up to 16 rows.
+
+Scratch is cached per shape and never freed, because a captured graph holds the
+pointers; freeing and reallocating at a different address would turn a replay
+into a read of unrelated memory. A budget caps the total, and running out of it
+falls back to the single-program kernel rather than allocating unsafely.
+
+Measured on RTX 2080 Ti, bs=1, byte-identical output throughout:
+
+  width     single    parallel
+    8192     202 us     122 us    1.7x
+   37500     671 us     111 us    6.0x
+  150000    2908 us     141 us   20.6x
+  262144    4525 us     177 us   25.6x
+---
+ .../sglang/kernels/ops/attention/dsv4/topk.py | 318 ++++++++++++++++++
+ 1 file changed, 318 insertions(+)
+
+diff --git a/python/sglang/kernels/ops/attention/dsv4/topk.py b/python/sglang/kernels/ops/attention/dsv4/topk.py
+index f436c12b82..ed93bd487f 100644
+--- a/python/sglang/kernels/ops/attention/dsv4/topk.py
++++ b/python/sglang/kernels/ops/attention/dsv4/topk.py
+@@ -178,6 +178,302 @@ def _topk_transform_paged_triton_kernel(
+         )
+ 
+ 
++@triton.jit
++def _topk_slab_kernel(
++    scores_ptr,
++    seq_lens_ptr,
++    part_ptr,
++    stride_scores,
++    n_partial,
++    K: tl.constexpr,
++    K_POW2: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    SLAB: tl.constexpr,
++):
++    """Top-K_POW2 of one slab of one row, written out for the merge.
++
++    Identical arithmetic to _topk_transform_paged_triton_kernel -- the same
++    bit-cast, sign-flip and bitonic-merge recurrence -- so each slab's result is
++    exactly the top-K_POW2 of the scores it covers. The recurrence's
++    accumulator is uint64, which matters: roughly half of all real scores pack
++    to a negative int64, and a signed comparison would select the smallest.
++    """
++    pid = tl.program_id(0)
++    row = pid // n_partial
++    s = pid % n_partial
++    seq_len = tl.load(seq_lens_ptr + row)
++    start0 = s * SLAB
++    offs_k = tl.arange(0, K_POW2)
++    # Slabs past the end of a short row must still write, and must write
++    # zeros: zero is below every real packed key, so it sorts last and cannot
++    # displace a winner.
++    if start0 >= seq_len:
++        tl.store(
++            part_ptr + pid * K_POW2 + offs_k,
++            tl.zeros((K_POW2,), tl.uint64).to(tl.int64, bitcast=True),
++        )
++        return
++    end = tl.minimum(start0 + SLAB, seq_len)
++    offs_n = tl.arange(0, BLOCK_N)
++    acc = tl.zeros((K_POW2,), dtype=tl.uint64)
++    for start in range(start0, end, BLOCK_N):
++        cols = start + offs_n
++        score = tl.load(
++            scores_ptr + row * stride_scores + cols,
++            mask=cols < end,
++            other=float("-inf"),
++        )
++        score_bits = score.to(tl.uint32, bitcast=True)
++        sign = tl.full(score_bits.shape, 0x80000000, tl.uint32)
++        key = tl.where(
++            (score_bits & sign) != 0,
++            ~score_bits,
++            score_bits ^ sign,
++        )
++        packed = (key.to(tl.uint64) << 32) | cols.to(tl.uint64)
++        candidate = tl.topk(packed, K_POW2, dim=0)
++        acc = tl.bitonic_merge(acc)
++        acc = tl.maximum(acc, tl.topk(candidate, K_POW2, dim=0))
++    acc = tl.sort(acc, descending=True)
++    tl.store(part_ptr + pid * K_POW2 + offs_k, acc.to(tl.int64, bitcast=True))
++
++
++@triton.jit
++def _topk_merge_sort_kernel(
++    in_ptr,
++    out_ptr,
++    K: tl.constexpr,
++    K_POW2: tl.constexpr,
++    FANIN: tl.constexpr,
++    N_OUT: tl.constexpr,
++    N_IN: tl.constexpr,
++):
++    """out[g] = top-K of in[g*FANIN : (g+1)*FANIN], by sorting the concatenation.
++
++    A full sort is exact by construction, which the bitonic recurrence used
++    inside a slab is not -- it happens to agree on raw score blocks, but it is
++    not a merge of pre-reduced lists. The sort runs on uint64 for the same
++    reason the slab accumulator does.
++
++    FANIN is capped at 2 because tl.sort's shared-memory use grows with the
++    sort width and SM75 has 64 KB: FANIN=8 (4096 int64) already asks for more
++    than that.
++    """
++    pid = tl.program_id(0)
++    row = pid // N_OUT
++    g = pid % N_OUT
++    offs = tl.arange(0, FANIN * K_POW2)
++    vals = tl.load(in_ptr + (row * N_IN + g * FANIN) * K_POW2 + offs)
++    srt = tl.sort(vals.to(tl.uint64, bitcast=True), descending=True)
++    # The K largest of the concatenation are its leading K_POW2 lanes, so the
++    # store is masked rather than a slice; Triton cannot slice a tensor, and
++    # tl.sort returns one rather than a pointer.
++    tl.store(
++        out_ptr + (row * N_OUT + g) * K_POW2 + offs,
++        srt.to(tl.int64, bitcast=True),
++        mask=offs < K_POW2,
++    )
++
++
++@triton.jit
++def _topk_merge_tail_paged_kernel(
++    in_ptr,
++    seq_lens_ptr,
++    page_tables_ptr,
++    out_page_indices_ptr,
++    out_raw_indices_ptr,
++    K: tl.constexpr,
++    K_POW2: tl.constexpr,
++    PAGE_SIZE: tl.constexpr,
++    page_table_width,
++    stride_page_tables,
++    WRITE_RAW: tl.constexpr,
++):
++    """Page-table transform of the final merge level.
++
++    Fusing keeps the parallel path to one kernel per level; left unfused it
++    costs about six small torch ops per token, which is real money against a
++    130 us kernel.
++
++    There is deliberately no sort here. The last merge level already reduced to
++    a single K_POW2 group per row, so this reads exactly K_POW2 lanes at a
++    K_POW2 stride. Reading a wider window would overlap the next row's answer,
++    which is invisible at one row and silently swaps rows at two.
++    """
++    row = tl.program_id(0)
++    offs = tl.arange(0, K_POW2)
++    best = tl.load(in_ptr + row * K_POW2 + offs).to(tl.uint64, bitcast=True)
++    raw = (best & 0xFFFFFFFF).to(tl.int32)
++    seq_len = tl.load(seq_lens_ptr + row)
++    valid = (offs < K) & (offs < seq_len)
++    page_ids = raw // PAGE_SIZE
++    page_ids = tl.where(valid, page_ids, 0)
++    # Same bound, and for the same reason, as the single-program kernel: raw is
++    # only known to be < seq_len, which does not imply raw // PAGE_SIZE is a
++    # valid column of the page table.
++    in_table = valid & (page_ids >= 0) & (page_ids < page_table_width)
++    pages = tl.load(
++        page_tables_ptr + row * stride_page_tables + page_ids,
++        mask=in_table,
++        other=0,
++    )
++    page_indices = pages * PAGE_SIZE + raw % PAGE_SIZE
++    page_indices = tl.where(in_table, page_indices, -1).to(tl.int32)
++    tl.store(
++        out_page_indices_ptr + row * K + offs,
++        page_indices,
++        mask=offs < K,
++    )
++    if WRITE_RAW:
++        raw = tl.where(valid, raw, -1)
++        tl.store(
++            out_raw_indices_ptr + row * K + offs,
++            raw,
++            mask=offs < K,
++        )
++
++
++# Below this allocated row width a single program is already cheap and
++# splitting it costs more than it saves: measured on RTX 2080 Ti, the parallel
++# path runs at 0.84x of the single-program kernel at 6144 and 1.66x at 8192.
++_PARALLEL_MIN_WIDTH = 8192
++# Only for few rows. The single-program kernel already runs one program per row,
++# so it has parallelism of its own; splitting each row is what pays, and that
++# stops paying as rows grow. Measured speedup at width 37500: 5.9x at 1 row,
++# 1.7x at 16, 0.93x at 32. At width 262144: 25.8x at 1, 3.4x at 16, 1.6x at 32,
++# 0.80x at 128. Capping at 16 keeps every win that matters for decode and no
++# regression, and bounds the buffers at 8 MB per shape.
++_PARALLEL_MAX_ROWS = 16
++# 32 partials win below 65536, 64 above it. Both are powers of two so the merge
++# level count stays fixed per branch.
++_PARALLEL_N_PARTIAL_SMALL = 32
++_PARALLEL_N_PARTIAL_LARGE = 64
++_PARALLEL_N_PARTIAL_SPLIT = 65536
++_PARALLEL_FANIN = 2
++# Ceiling on the scratch the cache may hold. Entries are never freed (see
++# below), so without this an unusual sequence of graph buckets would keep
++# growing resident memory on a pipeline that has under a gigabyte of headroom.
++_PARALLEL_BUFFER_BUDGET_ELEMS = 8 * 1024 * 1024
++
++# Buffers are keyed by shape and never released. A captured CUDA graph bakes the
++# pointers in, so reallocating under a live graph would silently make it read
++# someone else's memory. Falling back to the single-program kernel is the safe
++# way to run out of budget.
++_PARALLEL_BUFFERS: dict = {}
++_PARALLEL_BUFFER_ELEMS = 0
++
++
++def _parallel_buffers(rows, n_partial, fanin, K_POW2, device):
++    """Cached scratch for one shape, or None if the budget is exhausted.
++
++    Cached rather than pooled on purpose: a captured CUDA graph holds the
++    pointers, so a buffer freed and reallocated at a different address would
++    turn a graph replay into a read of unrelated memory. Holding it is the only
++    way to keep the capture valid.
++    """
++    global _PARALLEL_BUFFER_ELEMS
++    key = (rows, n_partial, fanin, K_POW2, device.index)
++    bufs = _PARALLEL_BUFFERS.get(key)
++    if bufs is not None:
++        return bufs
++    part_elems = rows * n_partial * K_POW2
++    level_elems = 0
++    cur_n = n_partial
++    while cur_n > 1:
++        cur_n = triton.cdiv(cur_n, fanin)
++        level_elems += rows * cur_n * fanin * K_POW2
++    if _PARALLEL_BUFFER_ELEMS + part_elems + level_elems > \
++            _PARALLEL_BUFFER_BUDGET_ELEMS:
++        return None
++    part = torch.zeros(part_elems, dtype=torch.int64, device=device)
++    levels = []
++    cur_n = n_partial
++    while cur_n > 1:
++        nxt = triton.cdiv(cur_n, fanin)
++        levels.append(
++            torch.zeros(
++                rows * nxt * fanin * K_POW2, dtype=torch.int64, device=device
++            )
++        )
++        cur_n = nxt
++    bufs = (part, levels)
++    _PARALLEL_BUFFERS[key] = bufs
++    _PARALLEL_BUFFER_ELEMS += part_elems + level_elems
++    return bufs
++
++
++def _topk_transform_paged_parallel(
++    scores: torch.Tensor,
++    seq_lens: torch.Tensor,
++    page_tables: torch.Tensor,
++    out_page_indices: torch.Tensor,
++    raw_indices: torch.Tensor,
++    write_raw: bool,
++    page_size: int,
++    K: int,
++    K_POW2: int,
++    BLOCK_N: int,
++) -> bool:
++    """Returns False if it declined to run, having done nothing."""
++    rows, width = scores.shape
++    fanin = _PARALLEL_FANIN
++    n_partial = (
++        _PARALLEL_N_PARTIAL_LARGE
++        if width >= _PARALLEL_N_PARTIAL_SPLIT
++        else _PARALLEL_N_PARTIAL_SMALL
++    )
++    cached = _parallel_buffers(rows, n_partial, fanin, K_POW2, scores.device)
++    if cached is None:
++        return False
++    part, levels = cached
++    n_blocks = triton.cdiv(width, BLOCK_N)
++    slab = triton.cdiv(n_blocks, n_partial) * BLOCK_N
++    _topk_slab_kernel[(rows * n_partial,)](
++        scores,
++        seq_lens,
++        part,
++        scores.stride(0),
++        n_partial,
++        K=K,
++        K_POW2=K_POW2,
++        BLOCK_N=BLOCK_N,
++        SLAB=slab,
++        num_warps=4,
++        num_stages=1,
++    )
++    cur, cur_n = part, n_partial
++    for lvl, dst in enumerate(levels):
++        nxt_n = triton.cdiv(cur_n, fanin)
++        _topk_merge_sort_kernel[(rows * nxt_n,)](
++            cur,
++            dst,
++            K=K,
++            K_POW2=K_POW2,
++            FANIN=fanin,
++            N_OUT=nxt_n,
++            N_IN=cur_n,
++            num_warps=4,
++            num_stages=1,
++        )
++        cur, cur_n = dst, nxt_n
++    _topk_merge_tail_paged_kernel[(rows,)](
++        cur,
++        seq_lens,
++        page_tables,
++        out_page_indices,
++        raw_indices,
++        K=K,
++        K_POW2=K_POW2,
++        PAGE_SIZE=page_size,
++        page_table_width=page_tables.shape[1],
++        stride_page_tables=page_tables.stride(0),
++        WRITE_RAW=write_raw,
++        num_warps=4,
++        num_stages=1,
++    )
++    return True
++
++
+ def topk_transform_paged_triton(
+     scores: torch.Tensor,
+     seq_lens: torch.Tensor,
+@@ -210,6 +506,28 @@ def topk_transform_paged_triton(
+         assert raw_indices.dtype == torch.int32
+         write_raw = True
+     BLOCK_N = max(256, min(K_POW2, 1024))
++    # Dispatch on the allocated row width and row count, not on seq_lens:
++    # inside a captured CUDA graph seq_lens is a device buffer whose values
++    # change per replay, so it cannot select a launch. Width and row count are
++    # fixed for a graph bucket, and the parallel path is correct for any ragged
++    # lengths under the width.
++    if (
++        scores.shape[1] >= _PARALLEL_MIN_WIDTH
++        and scores.shape[0] <= _PARALLEL_MAX_ROWS
++        and _topk_transform_paged_parallel(
++            scores,
++            seq_lens,
++            page_tables,
++            out_page_indices,
++            raw_indices,
++            write_raw,
++            page_size,
++            K,
++            K_POW2,
++            BLOCK_N,
++        )
++    ):
++        return
+     grid = (scores.shape[0],)
+     _topk_transform_paged_triton_kernel[grid](
+         scores,
+-- 
+2.43.0
+
+
+From 253d3fae31b199741ad4aec149e2e8e48fa825f5 Mon Sep 17 00:00:00 2001
+From: Steven Huang <shuang@myai001.mylab.io>
+Date: Fri, 2 Oct 2026 15:04:12 +0800
+Subject: [PATCH 4/6] chore(dsv4): kill switch and one-shot trace for the
+ parallel top-K
+
+The parallel top-K was measured end to end by restarting the server with one
+environment variable flipped, which is a fine way to attribute a regression --
+or to exonerate a change, which is what it was needed for here. Baking the
+switch into the launcher instead of into the code means going back and forth
+does not require an edit.
+
+SGLANG_OPT_SM75_PARALLEL_TOPK=0 restores the single-program kernel.
+SGLANG_OPT_SM75_TOPK_DIAG=1 logs, once per shape, the width and row count the
+dispatch actually sees and which path it chose. That log is the only trustworthy
+record of what a worker did: the schedulers rename themselves with
+setproctitle, so /proc/<pid>/environ reports the environment they were forked
+with, not the one they are running under. Reading that as evidence produced a
+confident and wrong conclusion once already.
+---
+ .../sglang/kernels/ops/attention/dsv4/topk.py | 31 ++++++++++++++++++-
+ 1 file changed, 30 insertions(+), 1 deletion(-)
+
+diff --git a/python/sglang/kernels/ops/attention/dsv4/topk.py b/python/sglang/kernels/ops/attention/dsv4/topk.py
+index ed93bd487f..a7a7f18738 100644
+--- a/python/sglang/kernels/ops/attention/dsv4/topk.py
++++ b/python/sglang/kernels/ops/attention/dsv4/topk.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import os
+ from typing import Optional
+ 
+ import torch
+@@ -355,6 +356,24 @@ _PARALLEL_FANIN = 2
+ # growing resident memory on a pipeline that has under a gigabyte of headroom.
+ _PARALLEL_BUFFER_BUDGET_ELEMS = 8 * 1024 * 1024
+ 
++# Kill switch, so the parallel path can be turned off without a rebuild. It is
++# the only way to attribute a decode regression to this change or to whatever
++# else moved, which is not always decidable from the outside.
++_PARALLEL_ENABLED = os.environ.get("SGLANG_OPT_SM75_PARALLEL_TOPK", "1") != "0"
++
++# One-shot, env-gated trace of which path each shape took and how wide the
++# dispatch actually sees things. /proc/<pid>/environ is not evidence for a
++# forked scheduler -- it renames itself, so the env it reports is stale -- so
++# the only trustworthy record of what a worker did is its own log.
++_PARALLEL_DIAG = os.environ.get("SGLANG_OPT_SM75_TOPK_DIAG", "0") == "1"
++_PARALLEL_DIAG_SEEN: set = set()
++
++
++def _diag(msg):
++    import logging
++
++    logging.getLogger(__name__).warning("[dsv4-topk-diag] %s", msg)
++
+ # Buffers are keyed by shape and never released. A captured CUDA graph bakes the
+ # pointers in, so reallocating under a live graph would silently make it read
+ # someone else's memory. Falling back to the single-program kernel is the safe
+@@ -506,13 +525,23 @@ def topk_transform_paged_triton(
+         assert raw_indices.dtype == torch.int32
+         write_raw = True
+     BLOCK_N = max(256, min(K_POW2, 1024))
++    if _PARALLEL_DIAG:
++        key = (scores.shape[1], scores.shape[0])
++        if key not in _PARALLEL_DIAG_SEEN:
++            _PARALLEL_DIAG_SEEN.add(key)
++            _diag(
++                f"enabled={_PARALLEL_ENABLED} width={key[0]} rows={key[1]} "
++                f"K={K} "
++                f"path={'parallel' if (_PARALLEL_ENABLED and key[0] >= _PARALLEL_MIN_WIDTH and key[1] <= _PARALLEL_MAX_ROWS) else 'single'}"
++            )
+     # Dispatch on the allocated row width and row count, not on seq_lens:
+     # inside a captured CUDA graph seq_lens is a device buffer whose values
+     # change per replay, so it cannot select a launch. Width and row count are
+     # fixed for a graph bucket, and the parallel path is correct for any ragged
+     # lengths under the width.
+     if (
+-        scores.shape[1] >= _PARALLEL_MIN_WIDTH
++        _PARALLEL_ENABLED
++        and scores.shape[1] >= _PARALLEL_MIN_WIDTH
+         and scores.shape[0] <= _PARALLEL_MAX_ROWS
+         and _topk_transform_paged_parallel(
+             scores,
+-- 
+2.43.0
+
+
+From e8e7421c4f28976204f8307c8ac58d930d3b925e Mon Sep 17 00:00:00 2001
+From: Steven Huang <shuang@myai001.mylab.io>
+Date: Fri, 2 Oct 2026 23:43:48 +0800
+Subject: [PATCH 5/6] chore(dist): decompose one pipeline handoff on the host
+
+A py-spy profile attributed a quarter of the bs=1 decode step to
+recv_tensor_dict but said nothing about which part of it. Whether the cost is
+the pickled metadata round trip, the per-tensor blocking receive, or the
+all-gather decides what is worth changing, and guessing had already produced one
+wrong conclusion today.
+
+SGLANG_OPT_PP_HANDOFF_DIAG=1 logs a per-phase breakdown, once per
+SGLANG_OPT_PP_HANDOFF_EVERY calls (default 200), with the payload it carries.
+
+Host-side timing only. Nothing here synchronises with the device, which is the
+whole constraint: this runs inside captured CUDA graphs, so one added .item()
+would break capture. When the flag is off the only added cost is a call that
+returns False.
+
+The answer was that it is worth almost nothing. Steady state at bs=1:
+
+  RECV metadata=0.014ms irecv=0.000ms allgather=0.000ms total=0.015ms
+
+Three hops is 0.045 ms against a 37.3 ms step -- 0.1%. The payload is one
+(6, 16384) fp16 tensor and 177 bytes of pickle. The path is not the bottleneck
+and rewriting it would buy nothing.
+
+What the measurement does show is where the cost went instead: the profile's
+time is in _pp_commit_comm_work, which waits on the async sends issued earlier.
+Those are fast to issue and slow to complete, because at bs=1 the peer is still
+computing the previous token. The wait absorbs the pipeline stall rather than
+being overhead of its own.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ .../sglang/srt/distributed/parallel_state.py  | 85 +++++++++++++++++++
+ 1 file changed, 85 insertions(+)
+
+diff --git a/python/sglang/srt/distributed/parallel_state.py b/python/sglang/srt/distributed/parallel_state.py
+index 37c6732744..1bd63042b9 100644
+--- a/python/sglang/srt/distributed/parallel_state.py
++++ b/python/sglang/srt/distributed/parallel_state.py
+@@ -30,6 +30,7 @@ import logging
+ import os
+ import pickle
+ import sys
++import time
+ import warnings
+ import weakref
+ from collections import namedtuple
+@@ -245,6 +246,56 @@ def reg_all_to_all_single(
+     group._all_to_all_single(output, input)
+ 
+ 
++_PP_HANDOFF_DIAG = os.environ.get("SGLANG_OPT_PP_HANDOFF_DIAG", "0") == "1"
++# Sample periodically, not once. A single sample lands in warmup, and the
++# receive timing includes waiting for the upstream stage, so the first
++# call is the least representative one available.
++_PP_HANDOFF_EVERY = int(os.environ.get("SGLANG_OPT_PP_HANDOFF_EVERY", "200"))
++_PP_HANDOFF_COUNT: dict = {}
++
++
++def _pp_sample(tag: str, ident: int) -> bool:
++    """True on every Nth call for this site. No-op when the diag is off."""
++    if not _PP_HANDOFF_DIAG:
++        return False
++    key = (tag, ident)
++    n = _PP_HANDOFF_COUNT.get(key, 0) + 1
++    _PP_HANDOFF_COUNT[key] = n
++    return n % _PP_HANDOFF_EVERY == 0
++
++
++def _pp_handoff_diag(payload: str) -> None:
++    """Log one decomposition of a pipeline handoff, once per rank per side.
++
++    A py-spy profile puts about a quarter of the bs=1 decode step inside
++    recv_tensor_dict, but says nothing about which part of it. Whether the cost
++    is the pickled-metadata round trip, the per-tensor blocking receive, or the
++    all-gather decides what is worth changing, and guessing has already produced
++    one wrong conclusion today.
++
++    Host-side timing only, and nothing here synchronises with the device: this
++    runs inside captured CUDA graphs, so one added .item() would break capture.
++    Off unless SGLANG_OPT_PP_HANDOFF_DIAG=1, and when off the only cost is a set
++    lookup.
++    """
++    logger.warning("[pp-handoff-diag] %s", payload)
++
++
++def _pp_payload_desc(tensor_list) -> str:
++    """Compact description of what a handoff carries at bs=1."""
++    parts = []
++    total = 0
++    for t in tensor_list[:8]:
++        try:
++            nb = t.numel() * t.element_size()
++        except Exception:
++            nb = 0
++        total += nb
++        parts.append(f"{tuple(t.shape)}:{str(t.dtype).replace('torch.', '')}")
++    more = "" if len(tensor_list) <= 8 else f" +{len(tensor_list) - 8} more"
++    return f"n={len(tensor_list)} bytes={total} [{', '.join(parts)}{more}]"
++
++
+ class GroupCoordinator:
+     """
+     PyTorch ProcessGroup wrapper for a group of processes.
+@@ -1785,6 +1836,8 @@ class GroupCoordinator:
+                 async_handle.wait()
+         return tensor_dict
+ 
++
++
+     def send_tensor_dict(
+         self,
+         tensor_dict: Dict[str, Union[torch.Tensor, Any]],
+@@ -1792,6 +1845,7 @@ class GroupCoordinator:
+         all_gather_group: Optional["GroupCoordinator"] = None,
+         async_send: bool = False,
+     ) -> Optional[List[P2PWork]]:
++        _dg = _pp_sample("send", id(self))
+         """Send the input tensor dictionary.
+         NOTE: `dst` is the local rank of the source rank.
+         """
+@@ -1823,7 +1877,10 @@ class GroupCoordinator:
+         # Thus the net performance gain justifies this approach.
+ 
+         send_func = torch.distributed.isend if async_send else torch.distributed.send
++        _t0 = time.perf_counter() if _dg else 0.0
+         p2p_works = self.send_object(metadata_list, dst=dst, async_send=async_send)
++        _t1 = time.perf_counter() if _dg else 0.0
++        _n_ag = 0
+ 
+         for tensor in tensor_list:
+             if tensor.numel() == 0:
+@@ -1833,11 +1890,20 @@ class GroupCoordinator:
+             # send-allgather: send only a slice, then do allgather.
+             if all_gather_group is not None and tensor.numel() % all_gather_size == 0:
+                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
++                _n_ag += 1
+ 
+             comm_group = metadata_group if tensor.is_cpu else group
+             work = send_func(tensor, self.ranks[dst], group=comm_group)
+             if async_send:
+                 p2p_works.append(P2PWork(work, tensor))
++        if _dg:
++            _t2 = time.perf_counter()
++            _pp_handoff_diag(
++                f"SEND metadata={_t1 - _t0:.3f}ms "
++                f"tensors={_t2 - _t1:.3f}ms(n={len(tensor_list)},"
++                f"allgather={_n_ag}) payload={_pp_payload_desc(tensor_list)} "
++                f"pickle_bytes={len(pickle.dumps(metadata_list))}"
++            )
+         return p2p_works
+ 
+     def recv_tensor_dict(
+@@ -1864,7 +1930,13 @@ class GroupCoordinator:
+             src = (self.rank_in_group - 1) % self.world_size
+         assert src < self.world_size, f"Invalid src rank ({src})"
+ 
++        _dg = _pp_sample("recv", id(self))
++        _t0 = time.perf_counter() if _dg else 0.0
+         recv_metadata_list = self.recv_object(src=src)
++        _t1 = time.perf_counter() if _dg else 0.0
++        _t_irecv = 0.0
++        _t_ag = 0.0
++        _n_ag = 0
+         tensor_dict: Dict[str, Any] = {}
+         for key, value in recv_metadata_list:
+             if isinstance(value, TensorMetadata):
+@@ -1886,18 +1958,31 @@ class GroupCoordinator:
+ 
+                 # We have to use irecv here to make it work for both isend and send.
+                 comm_group = metadata_group if tensor.is_cpu else group
++                _a = time.perf_counter() if _dg else 0.0
+                 work = torch.distributed.irecv(
+                     tensor, src=self.ranks[src], group=comm_group
+                 )
+                 work.wait()
++                if _dg:
++                    _t_irecv += time.perf_counter() - _a
++                    _a = time.perf_counter()
+ 
+                 if use_all_gather:
+                     tensor = all_gather_group.all_gather(tensor, dim=0)
+                     tensor = tensor.reshape(orig_shape)
++                    if _dg:
++                        _t_ag += time.perf_counter() - _a
++                        _n_ag += 1
+ 
+                 tensor_dict[key] = tensor
+             else:
+                 tensor_dict[key] = value
++        if _dg:
++            _pp_handoff_diag(
++                f"RECV metadata={_t1 - _t0:.3f}ms "
++                f"irecv={_t_irecv:.3f}ms allgather={_t_ag:.3f}ms(n={_n_ag}) "
++                f"total={time.perf_counter() - _t0:.3f}ms"
++            )
+         return tensor_dict
+ 
+     def send_recv_tensor_dict(
+-- 
+2.43.0
+
+
+From a588149ab0bc1c4a91dc8674b6ca6a8f28d9b127 Mon Sep 17 00:00:00 2001
+From: Steven Huang <shuang@myai001.mylab.io>
+Date: Sun, 4 Oct 2026 23:16:41 +0800
+Subject: [PATCH 6/6] fix(function_call): recover drifted DeepSeek tool calls
+ instead of dropping them
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+An agent loop against a live server died in two different ways, and both were
+the parser's fault rather than the model's. A 45-message session made 21 tool
+calls; the failures clustered here:
+
+  1. A parameter written without its string attribute, or with the attribute
+     value unquoted or capitalised. The attribute was mandatory in
+     parameter_regex, so the parameter did not match at all, DSML text was left
+     over, and the whole call was dropped as malformed.
+  2. The same call, closed with a plain tag instead of a ｜DSML｜ prefixed one.
+     Same cause: the closer could not match, so the leftover check tripped.
+  3. The name written as `Bash` or `Read` where the client declared `bash` and
+     `read`. The server passed the name through unchanged, the client answered
+     "Tool Read not found", the model retried, and the session made no progress.
+
+Closers are now matched with the ｜DSML｜ prefix optional, while open tags stay
+strict so prose that quotes a tag is not mistaken for a call. The string
+attribute is optional, and its value is read case-insensitively; when it is
+absent or unrecognised the value is parsed as JSON and falls back to a plain
+string, so an attribute slip cannot cost the call. Name repair moved into
+BaseFormatDetector._canonical_tool_name: trim whitespace and quotes, drop an
+OpenAI-style `functions.` prefix, then match case-insensitively against the
+declared tools. Names that match no declared tool are returned as they came.
+
+Case-insensitive matching belongs in both paths, which is how the third failure
+survived the first round of fixes: the streaming path builds its ToolCallItem
+directly and never goes through parse_base_json, so repairing the name there
+only served one-shot clients. Streaming clients, which is what an agent loop
+uses, kept receiving the raw name. Unknown names are still forwarded rather
+than dropped, because a client error is what lets the model correct itself; the
+streaming path now logs them, which it previously did not, so this class of
+drift is no longer invisible in the server log.
+
+Accepting an attribute-less parameter reverses one documented decision: that
+test case asserted the call be dropped. It is replaced with tests for the
+drift shapes that actually occur, and the bounded cases -- a self-closed
+parameter, a parameter that never closes -- still fail closed.
+
+The attribute and closer fixes are confirmed by a live 21-turn agent session
+that logged no dropped call and no malformed drop. The name repair is the one
+fix not yet seen in the field: the session that produced `Tool Read not found`
+ran before it shipped, and the session after it happened to spell every name in
+lowercase. It is therefore covered by tests at several chunk widths rather than
+by a field log. test_deepseekv4_detector is 32 tests OK, up from 25. The other
+function-call suites report exactly the baseline failures, unchanged:
+test_deepseekv41_detector (4 errors) and test_function_call_parser (4 failures,
+8 errors) were already red on this commit, and the two unknown-tool semantics
+tests still pass.
+---
+ .../srt/function_call/base_format_detector.py |  39 ++++-
+ .../srt/function_call/deepseekv32_detector.py |  44 +++--
+ .../function_call/test_deepseekv4_detector.py | 154 +++++++++++++++++-
+ 3 files changed, 225 insertions(+), 12 deletions(-)
+
+diff --git a/python/sglang/srt/function_call/base_format_detector.py b/python/sglang/srt/function_call/base_format_detector.py
+index 6905f42d58..03755557bb 100644
+--- a/python/sglang/srt/function_call/base_format_detector.py
++++ b/python/sglang/srt/function_call/base_format_detector.py
+@@ -74,6 +74,43 @@ class BaseFormatDetector(ABC):
+             tool.function.name: i for i, tool in enumerate(tools) if tool.function.name
+         }
+ 
++    def _canonical_tool_name(self, name: Any, tools: List[Tool]) -> Any:
++        """
++        Map a model-produced tool name onto the canonical name declared in tools.
++
++        Models occasionally drift when emitting a tool name: capitalising it
++        (``Bash`` for ``bash``), wrapping it in quotes, padding it with
++        whitespace, or prefixing it in OpenAI style (``functions.bash``). Those
++        are still the same tool, so repairing the name keeps the call executable
++        instead of handing the client an "unknown tool" error. Names that do not
++        correspond to any declared tool are returned unchanged (cleaned), and the
++        caller decides whether to drop or forward them.
++
++        Args:
++            name: tool name as produced by the model
++
++        Returns:
++            Canonical tool name when it can be resolved, otherwise the cleaned name
++        """
++        if not isinstance(name, str):
++            return name
++
++        cleaned = name.strip().strip("\"'`")
++        candidates = [cleaned]
++        for prefix in ("functions.", "function.", "tool.", "tool:"):
++            if cleaned.lower().startswith(prefix):
++                candidates.append(cleaned[len(prefix) :])
++
++        tool_indices = self._get_tool_indices(tools)
++        lowered = {n.lower(): n for n in tool_indices}
++        for cand in candidates:
++            if cand in tool_indices:
++                return cand
++            canonical = lowered.get(cand.lower())
++            if canonical is not None:
++                return canonical
++        return cleaned
++
+     def parse_base_json(self, action: Any, tools: List[Tool]) -> List[ToolCallItem]:
+         tool_indices = self._get_tool_indices(tools)
+         if not isinstance(action, list):
+@@ -81,7 +118,7 @@ class BaseFormatDetector(ABC):
+ 
+         results = []
+         for act in action:
+-            name = act.get("name")
++            name = self._canonical_tool_name(act.get("name"), tools)
+             if not (name and name in tool_indices):
+                 logger.warning(f"Model attempted to call undefined function: {name}")
+                 if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
+diff --git a/python/sglang/srt/function_call/deepseekv32_detector.py b/python/sglang/srt/function_call/deepseekv32_detector.py
+index 57d3a57bbf..824d46cae3 100644
+--- a/python/sglang/srt/function_call/deepseekv32_detector.py
++++ b/python/sglang/srt/function_call/deepseekv32_detector.py
+@@ -86,17 +86,24 @@ class DeepSeekV32Detector(BaseFormatDetector):
+         self.eot_token = f"</{block}>"
+         self.invoke_start_token = f"<{invoke}"
+         self.invoke_end_token = f"</{invoke}>"
++        # Models occasionally drop the ｜DSML｜ prefix when closing a tag, so closers
++        # accept its absence. Open tags stay strict, so a tag named in prose is not
++        # mistaken for the start of a call.
++        def _close(tag: str) -> str:
++            return rf"</(?:{self.dsml_token})?{tag}>"
++
+         self.parameter_regex = (
+-            rf'<{parameter}\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*?)</{parameter}>'
++            rf'<{parameter}\s+name="([^"]+)"'
++            r'(?:\s+string\s*=\s*"?([^"\s>]+)"?)?\s*>(.*?)'
++            + _close(self.parameter_tag_name)
++        )
++        self.function_calls_regex = rf"<{block}>(.*?)" + _close(
++            self.tool_calls_block_name
+         )
+-        self.function_calls_regex = rf"<{block}>(.*?)</{block}>"
+-        # Long-form `<｜DSML｜invoke name="x">...</｜DSML｜invoke>` and the
+-        # self-closing `<｜DSML｜invoke name="x"/>` shape V4 emits for zero-arg
+-        # tools. The `end` group is empty when the closer hasn't streamed in.
+         self.invoke_regex = (
+             rf'<{invoke}\s+name="(?P<name>[^"]+)"\s*'
+             r"(?:(?P<self_close>/>)"
+-            rf"|>(?P<body>.*?)(?P<end>(?:</{invoke}>|$)))"
++            + rf"|>(?P<body>.*?)(?P<end>(?:{_close(self.invoke_tag_name)}|$)))"
+         )
+         self.current_tool_id = -1
+ 
+@@ -164,18 +171,21 @@ class DeepSeekV32Detector(BaseFormatDetector):
+         for match in param_matches:
+             leftover.append(invoke_content[last_match_end : match.start()])
+             param_name = match.group(1)
+-            param_type = match.group(2)
++            raw_type = match.group(2)
+             param_value = match.group(3)
++            param_type = raw_type.strip().lower() if raw_type else None
+             last_match_end = match.end()
+             # Convert value based on type
+-            if param_type == "true":  # string type
++            if param_type in ("true", "string"):  # string type
+                 parameters[param_name] = (
+                     param_value.strip()
+                     if self.strip_string_param_value
+                     else param_value
+                 )
+             else:
+-                # Try to parse as JSON for other types
++                # Absent, "false", or any other marker: try JSON first, then
++                # fall back to a plain string so a missing/typo'd attribute
++                # does not cause the whole call to be dropped.
+                 try:
+                     parameters[param_name] = json.loads(
+                         param_value.strip(), parse_constant=_reject_json_constant
+@@ -188,7 +198,10 @@ class DeepSeekV32Detector(BaseFormatDetector):
+         if self.dsml_token in leftover_text or (
+             not param_matches and leftover_text.strip()
+         ):
+-            raise ValueError("Malformed DeepSeek tool parameter")
++            # Keep a truncated leftover snippet so drift stays debuggable without
++            # flooding the log.
++            snippet = leftover_text.strip().replace("\n", "\\n")[:240]
++            raise ValueError(f"Malformed DeepSeek tool parameter: {snippet!r}")
+ 
+         return json.dumps(parameters, ensure_ascii=False)
+ 
+@@ -310,6 +323,17 @@ class DeepSeekV32Detector(BaseFormatDetector):
+                 if not is_tool_end:
+                     break
+ 
++                # Repair a drifted tool name (Bash / Read / functions.bash) instead of
++                # letting a case slip turn into a "Tool X not found" retry loop.
++                func_name = self._canonical_tool_name(func_name, tools)
++                if func_name not in self._get_tool_indices(tools):
++                    # Still forward the call, so the client's error message lets the
++                    # model correct itself; logging keeps this drift class visible.
++                    logger.warning(
++                        "DeepSeek tool call name is not in the tool list: %r",
++                        func_name,
++                    )
++
+                 # Initialize state on the first complete invoke, malformed or
+                 # not: the preamble is released once and the trailing DSML is
+                 # withheld by finish() either way.
+diff --git a/test/registered/unit/function_call/test_deepseekv4_detector.py b/test/registered/unit/function_call/test_deepseekv4_detector.py
+index f0d18262d5..d144629f42 100644
+--- a/test/registered/unit/function_call/test_deepseekv4_detector.py
++++ b/test/registered/unit/function_call/test_deepseekv4_detector.py
+@@ -1,5 +1,6 @@
+ """Unit tests for DeepSeekV4Detector DSML streaming — no server, no model loading."""
+ 
++import logging
+ import unittest
+ from unittest.mock import patch
+ 
+@@ -217,7 +218,6 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
+         """Leftover text containing a DSML fragment is a parameter that failed
+         to match; the call is dropped rather than emitted without it."""
+         bodies = {
+-            "missing string attr": f'<{DSML}parameter name="city">SF</{DSML}parameter>',
+             "self-closing": f'<{DSML}parameter name="city" string="true"/>',
+             "unclosed after valid": _param("city", "true", "SF")
+             + f'<{DSML}parameter name="units" string="true">C',
+@@ -418,5 +418,157 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
+         self.assertEqual(second.normal_text, " tail")
+ 
+ 
++def _close(tag: str) -> str:
++    """Closing tag for ``tag``, assembled so the spelling stays in one place."""
++    return "</" + tag + ">"
++
++
++class TestDeepSeekV4DriftTolerance(unittest.TestCase):
++    """Drift observed in a long agentic session on 2026-10-04.
++
++    A client that refuses a tool call over one capital letter turns a soft model
++    slip into a retry loop, so a name that still identifies exactly one declared
++    tool is repaired rather than rejected. A name that matches no declared tool
++    is forwarded unchanged and warned about, leaving the client free to tell the
++    model what it called and the log free to show what drifted.
++    """
++
++    def setUp(self):
++        def declared(name, prop):
++            return Tool(
++                type="function",
++                function=Function(
++                    name=name,
++                    description=f"{name} tool",
++                    parameters={
++                        "type": "object",
++                        "properties": {prop: {"type": "string"}},
++                        "required": [prop],
++                    },
++                ),
++            )
++
++        self.tools = [declared("bash", "command"), declared("read", "path")]
++
++    @staticmethod
++    def _param(body, value, prefixed_closer=True):
++        closer = _close(DSML + "parameter") if prefixed_closer else _close("parameter")
++        return f"<{DSML}parameter {body}>{value}{closer}"
++
++    def _invoke(self, name, parameter):
++        return (
++            f"<{DSML}tool_calls>\n"
++            f'<{DSML}invoke name="{name}">\n{parameter}\n'
++            f"{_close(DSML + 'invoke')}\n{_close(DSML + 'tool_calls')}"
++        )
++
++    def _stream(self, text, width=7):
++        """Parse in small deltas: the repair must not depend on chunk width."""
++        detector = DeepSeekV4Detector()
++        calls = []
++        for start in range(0, len(text), width):
++            result = detector.parse_streaming_increment(
++                text[start : start + width], self.tools
++            )
++            calls.extend(result.calls)
++        calls.extend(detector.parse_streaming_increment("", self.tools).calls)
++        return [(call.name, call.parameters) for call in calls]
++
++    def test_parameter_without_string_attribute_is_still_parsed(self):
++        """A missing string attribute used to cost the whole call; the value is
++        recovered as a string instead."""
++        text = self._invoke("bash", self._param('name="command"', "echo hi"))
++
++        self.assertEqual(self._stream(text), [("bash", '{"command": "echo hi"}')])
++
++    def test_loose_string_attribute_is_still_parsed(self):
++        bodies = {
++            "unquoted": 'name="command" string=true',
++            "capital value": 'name="command" string="True"',
++            "padded": 'name="command" string = "true"',
++        }
++        for label, body in bodies.items():
++            with self.subTest(label=label):
++                text = self._invoke("bash", self._param(body, "pwd"))
++
++                self.assertEqual(self._stream(text), [("bash", '{"command": "pwd"}')])
++
++    def test_closer_without_dsml_prefix_is_accepted(self):
++        """The exact production shape: a correct parameter closed as a plain
++        html tag. Dropping it stalled the agent loop."""
++        text = self._invoke(
++            "bash",
++            self._param(
++                'name="command" string="true"', "echo hello", prefixed_closer=False
++            ),
++        )
++
++        self.assertEqual(self._stream(text), [("bash", '{"command": "echo hello"}')])
++
++    def test_tool_name_drift_is_repaired_to_the_declared_name(self):
++        for spelled, declared in [
++            ("Bash", "bash"),
++            ("BASH", "bash"),
++            (" bash ", "bash"),
++            ("functions.bash", "bash"),
++            ("Read", "read"),
++        ]:
++            with self.subTest(spelled=spelled):
++                text = self._invoke(
++                    spelled, self._param('name="command" string="true"', "ls")
++                )
++
++                self.assertEqual(self._stream(text), [(declared, '{"command": "ls"}')])
++                one_shot = DeepSeekV4Detector().detect_and_parse(text, self.tools)
++                self.assertEqual(
++                    [(call.name, call.parameters) for call in one_shot.calls],
++                    [(declared, '{"command": "ls"}')],
++                )
++
++    def test_quoted_name_is_repaired_where_names_arrive_as_json(self):
++        """The direct-JSON shape and every other detector hand the parsed name
++        straight to parse_base_json, so the quote repair belongs there."""
++        detector = DeepSeekV4Detector()
++        for spelled, declared in [
++            ('"bash"', "bash"),
++            (" bash ", "bash"),
++            ("BASH", "bash"),
++            ("functions.read", "read"),
++        ]:
++            with self.subTest(spelled=spelled):
++                calls = detector.parse_base_json(
++                    {"name": spelled, "parameters": {}}, self.tools
++                )
++
++                self.assertEqual([call.name for call in calls], [declared])
++
++    def test_unknown_tool_name_is_forwarded_with_a_warning(self):
++        text = self._invoke(
++            "exec_command", self._param('name="cmd" string="true"', "ls -la")
++        )
++
++        with self.assertLogs(
++            "sglang.srt.function_call.deepseekv32_detector", logging.WARNING
++        ) as logged:
++            calls = self._stream(text)
++
++        self.assertEqual(calls, [("exec_command", '{"cmd": "ls -la"}')])
++        self.assertTrue(
++            any("not in the tool list" in r.getMessage() for r in logged.records),
++            "an unrecognised name must leave a trace in the server log",
++        )
++
++    def test_unparseable_parameter_still_fails_closed(self):
++        """Tolerance is bounded: a parameter that never closes must not leak a
++        half-read argument into the call."""
++        text = self._invoke(
++            "bash",
++            self._param('name="command" string="true"', "ls")
++            + f'<{DSML}parameter name="timeout" string="true">5',
++        )
++
++        self.assertEqual(self._stream(text), [])
++
++
+ if __name__ == "__main__":
+     unittest.main()
+-- 
+2.43.0
+

@@ -19,7 +19,7 @@ to start.
 | `nvcc` on PATH (CUDA 12.9) | the PTX W4A16 expert kernels are JIT-compiled at load; on this box only cuda-12.9 actually ships one |
 | `ninja` on PATH | same; without it the JIT helper returns `None` silently and you fall back to the ~6.6x slower Triton kernel |
 | `--mem-fraction-static` >= 0.969 | weights are 96.8% of a 22 GiB card |
-| `--chunked-prefill-size` <= 512 | the sub-90 sparse-MLA prefill materialises `[tokens, 128 heads, 512]` fp32 per layer; 2048 OOMs a PP3 card during warmup |
+| `--chunked-prefill-size` <= 512, and 256 at 256K context | the sub-90 sparse-MLA prefill materialises `[tokens, 128 heads, 512]` fp32 per layer; 2048 OOMs a PP3 card during warmup, and 512 eats the transient headroom PP0 needs for a 256K prefill |
 | 150 W power limit | higher risks GPU6/7 hangs |
 
 ## 2. Install
@@ -27,7 +27,7 @@ to start.
 ```bash
 VENV=/data/nvme/sglang/.venv
 "$VENV/bin/pip" install --no-deps --force-reinstall \
-    sglang-0.5.21.dev797+g331faaeaf7.sm75main2-py3-none-any.whl
+    sglang-0.5.21.dev803+ga588149ab0.sm75main3-py3-none-any.whl
 "$VENV/bin/pip" install "sglang-kernel==0.4.7"
 ```
 
@@ -69,11 +69,14 @@ tail -f logs/serve-prod.log        # ready when it says "fired up and ready to r
 ```
 
 Every setting in the launcher is an environment variable override, so an A/B
-does not need the file edited: `MEM_FRACTION=0.97 CHUNK=512 MAXREQ=16
-./launch-dsv4-sm75.sh`. The A/B switches for the individual kernels are
-`SGLANG_SM75_*` and `SGLANG_DSV4_*`; `SGLANG_DSV4_DECODE_SEQ_LEN_BUCKETS=`
-(one graph per batch size) and `SGLANG_OPT_USE_SM75_C4_TOPK=0` are the two with
-the largest effect.
+does not need the file edited: `MEM_FRACTION=0.97 CHUNK=128 MAXREQ=16
+./launch-dsv4-sm75.sh`. Do not raise `CHUNK` back to 512 to chase prefill
+throughput: at 256K context the indexer's `[Q, max_seqlen_k]` fp32 logits scale
+with it -- 133 MiB at 512 against 66 MiB at 256 -- against 0.46 GB of headroom
+on PP0. The A/B switches for the individual kernels are `SGLANG_SM75_*` and
+`SGLANG_DSV4_*`; `SGLANG_DSV4_DECODE_SEQ_LEN_BUCKETS=` (one graph per batch
+size) and `SGLANG_OPT_USE_SM75_C4_TOPK=0` are the two with the largest effect,
+and `SGLANG_OPT_SM75_PARALLEL_TOPK=0` turns off the slabbed long-context top-K.
 
 ## 5. Rebuilding the wheel
 
@@ -88,7 +91,8 @@ rather than from `git archive`, because without git metadata setuptools-scm's
 file finder drops 56 package-data entries (dotfiles, the agent docs), and it
 normalises the zip timestamps afterwards because `wheel` 0.48 ignores
 `SOURCE_DATE_EPOCH`. Verified: two runs produce the same sha256, and the wheel
-is byte-identical to the tree that was benchmarked. To rebuild from the patches instead
-of a checkout, apply `sm75-main2-series.patch` (or
-`sm75-optimizations.patch`) to upstream `main` at `98fce73d5b` first; both
-apply cleanly to that commit.
+is byte-identical to the tree that was benchmarked. To rebuild from the patches
+instead of a checkout, apply `sm75-optimizations.patch` to upstream `main` at
+`98fce73d5b`, or `sm75-main3-series.patch` to `sm75main2`'s commit
+`331faaeaf7`. Both were checked to apply cleanly and to produce a tree identical
+to the released commit.

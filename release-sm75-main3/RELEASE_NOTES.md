@@ -1,5 +1,161 @@
-# RELEASE NOTES — sm75 on current main (`sm75main2`)
+# RELEASE NOTES — sm75 on current main (`sm75main3`)
 
+Base: upstream `main` @ `98fce73d5b` (unchanged since `sm75main2`). Wheel:
+`sglang-0.5.21.dev803+ga588149ab0.sm75main3-py3-none-any.whl`. Source:
+[p4s2wd/sglang-sm75](https://github.com/p4s2wd/sglang-sm75) branch
+`sm75-dsv4-flash-main`, tagged `v0.2.1-sm75main3`. Six commits over
+`sm75main2`, verified on 2026-10-04 on the 8x RTX 2080 Ti box (SM75, 22 GiB,
+150 W), TP2 x PP4, `--context-length 262144`, `--chunked-prefill-size 256`,
+decode CUDA graphs on bs 1 and 2, KV pool 264,192 tokens,
+`kv-cache-dtype fp8_e4m3`.
+
+## Read this first: the 256K context is now real, not declared
+
+`sm75main2` accepted `--context-length 262144` and quietly sized the KV pool at
+**162,304 tokens**. That was an overcount, not a hardware limit:
+`_get_bytes_per_swa_token` multiplied the paged SWA cost by `num_layers_total`,
+every layer the stage owns, while only layers with compress ratio 0 have a
+sliding window at all. In the DeepSeek-V4-Flash split those are layers 0 and 1
+and both land on PP1, so PP0, PP2 and PP3 each paid SWA bytes for a pool they
+never allocate.
+
+Charging only the layers that own a window takes PP0 from 1944.75 to 1109.25
+bytes per full token. That commit measured the pool at 267,776 tokens against a
+`--max-total-tokens 270000` request; this box reports
+`max_total_num_tokens=264192` today, after the memory calculator has taken the
+graph buckets and the rest. Either way it clears the 262,144 that was asked for,
+so the declared context length is now the actual one -- the same launch on
+`sm75main2` reported 162,304. The c4 state term is left alone on purpose: it is
+priced per c4 layer and every stage owns c4 layers.
+
+Two consequences a deployer has to know about:
+
+- The freed memory becomes **pool, not headroom**. PP0 ends at 0.46 GB instead
+  of 0.64 GB, which is enough for the pool but not for a 256K prefill, whose
+  indexer needs `[Q, max_seqlen_k]` fp32 logits plus the fp16 score tile. So
+  this release ships `--chunked-prefill-size 256` in the launcher (was 512,
+  halving the logits buffer from 133 MiB to 66 MiB at 258K) and `_CHUNK 256` in
+  the score kernel (was 1024, 64 MiB -> 16 MiB). Both are pure tiling: the same
+  values are read.
+- **PP3 at 0.64 GB is now the binding rank**, not PP0. Anything that widens
+  memory use -- more graph buckets, a higher `--mem-fraction-static`, a bigger
+  `--chunked-prefill-size` -- should be checked against PP3 first.
+
+Measured on the box: a 258,941-token prefill completes, greedy output is
+byte-identical to the previous build on 6/6 prompts, and 200 GSM8K questions at
+parallel 8 give accuracy 0.945 with zero crashes and zero unhandled CUDA
+errors. The smaller prefill chunk costs about nothing: short prompts +16%, long
+prompts -10%, mean ~0.98x.
+
+## Read this too: tool calls survive model drift now
+
+An agent loop against the live server was dying in three ways, all of them the
+parser's fault rather than the model's. A parameter written without its
+`string` attribute, or with that value unquoted or capitalised, did not match
+`parameter_regex` at all; the leftover DSML then failed the malformed check and
+**the whole tool call was dropped**. The same call closed with a plain tag
+instead of a `｜DSML｜` prefixed one failed the same way. And a name written as
+`Bash` where the client declared `bash` was passed through untouched, so the
+client answered `Tool Bash not found`, the model retried, and the session spun.
+
+Closers now match with the `｜DSML｜` prefix optional (open tags stay strict, so a
+tag quoted in prose is not mistaken for a call), the `string` attribute is
+optional and read case-insensitively with a JSON-then-string fallback, and name
+repair lives in one helper that both the one-shot and the streaming path use.
+That last part is the reason the first attempt at this fix did not work in
+production: the streaming path builds its tool call directly and never goes
+through `parse_base_json`, so a repair made there only served one-shot clients --
+and an agent loop is a streaming client.
+
+Names that match no declared tool are still forwarded rather than dropped,
+because a client error is what lets the model correct itself; the streaming path
+now logs them, which it previously did not, so this class of drift is no longer
+invisible in the server log.
+
+Evidence, and the honest limit of it: the attribute and closer fixes are
+confirmed by a live 21-turn agent session that logged no dropped call. The name
+repair is not yet field-confirmed -- the session that produced the
+`Tool Read not found` loop ran before it shipped, and the session after it
+happened to spell every name in lowercase. It is covered by tests at three chunk
+widths instead of by a log line. `test_deepseekv4_detector` is 32 tests OK, up
+from 25; the bounded cases (a self-closed parameter, a parameter that never
+closes) still fail closed.
+
+## Long-context decode: the sparse top-K stops running on one SM
+
+`_topk_transform_paged_triton_kernel` was launching with a grid of `[1, 1, 1]`:
+one program, one of 68 SMs, 1.5% occupancy at bs=1, and the step grew with
+context. Each row is now split into slabs, one program per slab, merged
+afterwards. The merge is a full `tl.sort` of each fan-in group rather than the
+in-kernel bitonic recurrence, because sorting the concatenation is exact by
+construction while the recurrence only merges raw blocks -- that cost some speed
+and bought certainty. Measured on RTX 2080 Ti, bs=1, output byte-identical:
+
+| row width | single program | parallel | speedup |
+|---|---|---|---|
+| 8,192 | 202 us | 122 us | 1.7x |
+| 37,500 | 671 us | 111 us | 6.0x |
+| 150,000 | 2,908 us | 141 us | 20.6x |
+| 262,144 | 4,525 us | 177 us | 25.6x |
+
+It engages from row width 8,192 and up to 16 rows, and those thresholds are
+measured rather than guessed: at width 6,144 the parallel path runs at 0.84x of
+the single-program kernel, and at 32 rows at 0.93x, so below/above them it
+would be a regression. Dispatch is on allocated row width and row count, never
+on `seq_lens`, which inside a captured CUDA graph is a device buffer that
+changes per replay and cannot select a launch. Scratch is cached per shape and
+never freed, because a captured graph holds the pointers and reallocating at a
+new address would turn a replay into a read of unrelated memory; a budget caps
+the total and running out falls back to the single-program kernel.
+
+Switch: `SGLANG_OPT_SM75_PARALLEL_TOPK`, on by default, `=0` to disable.
+
+## Diagnostics that ship off
+
+`SGLANG_OPT_PP_HANDOFF_DIAG=1` breaks the pipeline handoff into metadata
+round trip, per-tensor receive and all-gather, once every
+`SGLANG_OPT_PP_HANDOFF_EVERY` calls (default 200), with the payload it carries.
+It exists because a py-spy profile attributed a quarter of the bs=1 decode step
+to `recv_tensor_dict` and said nothing about which part.
+
+The answer, so nobody spends that time again: at bs=1 steady state the three
+hops cost 0.045 ms against a 37.3 ms step -- 0.1%. The profile's time was in
+`_pp_commit_comm_work`, waiting on sends issued earlier, which is the pipeline
+stall itself and not overhead of its own. Host-side timing only: this runs inside
+captured CUDA graphs, so it synchronises with nothing, and with the flag off the
+only added cost is a call that returns False.
+
+## How this release was verified
+
+- **Wheel is byte-reproducible.** Two builds of `a588149ab0` produce the same
+  sha256 (`3e8a6942…40bdc`), so `SHA256SUMS` is reproducible, not descriptive.
+- **The packaged wheel was tested, not just built.** It was extracted and the
+  tool-call drift regression run against the extracted code.
+- **Both patches reproduce the released source.** `sm75-optimizations.patch`
+  applies cleanly to upstream `98fce73d5b` and the series patch applies cleanly
+  to `sm75main2`'s `331faaeaf7`; in both cases the resulting tree is identical
+  to `a588149ab0`, checked with `git diff --name-only`.
+- **Function-call suites, against a read-only worktree of the base commit.**
+  The only difference this release introduces is `test_deepseekv4_detector`
+  25 OK -> 32 OK. `test_deepseekv41_detector` (4 errors) and
+  `test_function_call_parser` (4 failures, 8 errors) were already red at the
+  base commit and are unchanged -- they are not caused by anything here.
+- **Production on this box runs this same commit** as an editable install, and
+  was restarted from it and health-checked with a tool-call request.
+
+## Inherited constraints (unchanged)
+
+Everything in the `sm75main2` notes below still applies: the sub-80 FP8 loader
+opt-in, the CUDA 12.9 PTX W4A16 sources, `ninja` on PATH, 150 W,
+`sglang-kernel` 0.4.7. One addition worth carrying forward: PP0 loads Triton
+kernels *while serving* -- `free device mem` was seen falling from 0.33 GiB to
+0.18 GiB as `get_and_clear_swa_pages_kernel` and others compiled late. Pre-loading
+them during engine init would remove the last avoidable OOM candidate on that
+rank; nobody has done it yet.
+
+---
+
+# Provenance: the `sm75main2` notes, kept as written
 Base: upstream `main` @ `98fce73d5b`. Wheel:
 `sglang-0.5.21.dev797+g331faaeaf7.sm75main2-py3-none-any.whl`. Verified on
 2026-10-01 on the 8x RTX 2080 Ti box (SM75, 22 GiB, 150 W), TP2 x PP4,
